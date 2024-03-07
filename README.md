@@ -1,4 +1,6 @@
 # GUIDE: Guidance-based Incremental Learning with Diffusion Models
+[![arXiv](https://img.shields.io/badge/arXiv-2403.03938-b31b1b.svg?style=flat)](https://arxiv.org/abs/2403.03938)
+
 ## Setup
 ###  Clone repo
 ```bash
@@ -74,7 +76,12 @@ python -m scripts.image_train --experiment_name=c100_ci10_ddim100_2ksteps_genint
 ## BibTeX
 If you find this work useful, please consider citing it:
 ```bibtex
-
+@article{cywinski2024guide,
+  title={GUIDE: Guidance-based Incremental Learning with Diffusion Models},
+  author={Cywi{\'n}ski, Bartosz and Deja, Kamil and Trzci{\'n}ski, Tomasz and Twardowski, Bart{\l}omiej and Kuci{\'n}ski, {\L}ukasz},
+  journal={arXiv preprint arXiv:2403.03938},
+  year={2024}
+}
 ```
 
 ## Acknowledgments
