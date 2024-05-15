@@ -1,10 +1,11 @@
+from collections import defaultdict
+
+import numpy as np
 import torch
 from torch.utils.data import Subset
 
 from .utils import get_stratified_subset
 from .wrapper import AppendName
-import numpy as np
-from collections import defaultdict
 
 
 def data_split(

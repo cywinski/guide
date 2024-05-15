@@ -6,30 +6,27 @@ numpy array. This can be used to produce samples for FID evaluation.
 import argparse
 import os
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch as th
 import torch.distributed as dist
+from torchvision.utils import make_grid
 
-from guided_diffusion import dist_util, logger
-from guided_diffusion.script_util import (
-    model_and_diffusion_defaults,
-    create_model_and_diffusion,
-)
-from guided_diffusion.script_args import (
+from guide import dist_util, logger
+from guide.script_args import (
     add_dict_to_argparser,
-    args_to_dict,
     all_training_defaults,
+    args_to_dict,
     preprocess_args,
 )
-from torchvision.utils import make_grid
-import matplotlib.pyplot as plt
+from guide.script_util import create_model_and_diffusion, model_and_diffusion_defaults
 
 
 def main():
     args = create_argparser().parse_args()
     preprocess_args(args)
 
-    os.environ["OPENAI_LOGDIR"] = f"sampled/{args.experiment_name}"
+    os.environ["OPENAI_LOGDIR"] = f"sampled/{args.wandb_experiment_name}"
 
     dist_util.setup_dist(args)
     logger.configure()
@@ -99,7 +96,9 @@ def main():
     dist.barrier()
     plt.figure()
     plt.axis("off")
-    samples_grid = make_grid(th.from_numpy(arr[:16]), 4, normalize=True).permute(1,2, 0)
+    samples_grid = make_grid(th.from_numpy(arr[:16]), 4, normalize=True).permute(
+        1, 2, 0
+    )
     plt.imshow(samples_grid)
     out_plot = os.path.join(
         logger.get_dir(), f"samples_{args.model_path.split('/')[-1][:-3]}"
@@ -119,7 +118,7 @@ def create_argparser():
             in_channels=1,
             model_num_classes=10,
             batch_size=16,
-            experiment_name="test",
+            wandb_experiment_name="test",
         )
     )
     parser = argparse.ArgumentParser()

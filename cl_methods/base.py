@@ -17,7 +17,3 @@ class CLMethod:
             drop_last=True,
         )
         return yielder(loader), loader, None
-
-    def get_additional_losses(self, train_loop, x, cond, t, x_t, t_scaled):
-        """Returns: (scalar, dict {name: scalar}), meaning (loss to add to the objective, additional losses)."""
-        return 0, {}

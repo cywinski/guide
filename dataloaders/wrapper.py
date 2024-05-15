@@ -1,9 +1,9 @@
-from os import path
 from copy import deepcopy
+from os import path
 
+import numpy as np
 import torch
 import torch.utils.data as data
-import numpy as np
 
 
 class CacheClassLabel(data.Dataset):

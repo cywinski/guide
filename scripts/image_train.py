@@ -13,31 +13,30 @@ from collections import OrderedDict
 
 import numpy as np
 import torch as th
-import wandb
 
+import wandb
 from cl_methods.utils import get_cl_method
 from dataloaders import base
 from dataloaders.datasetGen import *
 from dataloaders.utils import prepare_eval_loaders
-from evaluations.validation import Validator
-from guided_diffusion import dist_util, logger
-from guided_diffusion.logger import wandb_safe_log
-from guided_diffusion.resample import create_named_schedule_sampler
-from guided_diffusion.script_args import (
+from guide import dist_util, logger
+from guide.logger import wandb_safe_log
+from guide.resample import create_named_schedule_sampler
+from guide.script_args import (
     add_dict_to_argparser,
     all_training_defaults,
     args_to_dict,
     classifier_defaults,
     preprocess_args,
 )
-from guided_diffusion.script_util import (
-    create_classifier,
+from guide.script_util import (
     create_model_and_diffusion,
     create_resnet_classifier,
     model_and_diffusion_defaults,
     results_to_log,
 )
-from guided_diffusion.train_util import TrainLoop
+from guide.train_util import TrainLoop
+from guide.validation import calculate_accuracy_with_classifier
 
 # os.environ["WANDB_MODE"] = "disabled"
 
@@ -55,35 +54,19 @@ def run_training_with_args(args):
     if logger.get_rank_without_mpi_import() == 0:
         if args.wandb_api_key:
             os.environ["WANDB_API_KEY"] = args.wandb_api_key
+        wandb.init(
+            project=args.wandb_project_name,
+            name=args.wandb_experiment_name,
+            config=args,
+            entity=args.wandb_entity,
+        )
 
-        # On one of the clusters I use, wandb init sometimes randomly fails because of some networking issues.
-        # Retry several times.
-        for _ in range(10):
-            try:
-                wandb.init(
-                    project="diffusion_guidance_cl",
-                    name=args.experiment_name,
-                    config=args,
-                    entity="cl-diffusion",
-                )
-            except:
-                time.sleep(5)
-            else:
-                break
-
-    random_generator = None
-    print("Using manual seed = {}".format(args.seed))
-    th.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    th.cuda.manual_seed(args.seed)
-    th.backends.cudnn.deterministic = True
-    th.backends.cudnn.benchmark = False
-
-    random_generator = th.Generator()
-    random_generator.manual_seed(args.seed)
-    os.environ["OPENAI_LOGDIR"] = f"results/{args.experiment_name}"
+    args.seed = args.seed + logger.get_rank_without_mpi_import()
+    random_generator = seed_everything(args.seed)
+    os.environ["OPENAI_LOGDIR"] = f"results/{args.wandb_experiment_name}"
     os.makedirs(os.path.join(logger.get_dir(), "generated_examples"), exist_ok=True)
     logger.configure()
+    logger.log("Using manual seed = {}".format(args.seed))
 
     (
         train_dataset,
@@ -111,39 +94,24 @@ def run_training_with_args(args):
     if args.log_gradient_stats and not os.environ.get("WANDB_MODE") == "disabled":
         wandb.watch(model, log_freq=10)
     # if we are not training diffusion, we will not need this model
-    if args.class_cond:
+    if not args.train_with_disjoint_classifier:
         model.to(dist_util.dev())
-    print(model)
 
     classifier = None
     if args.train_with_disjoint_classifier:
-        print("creating disjoint classifier...")
-        if args.classifier_type == "resnet":
-            defaults = classifier_defaults()
-            parser = argparse.ArgumentParser()
-            add_dict_to_argparser(parser, defaults)
-            opts = parser.parse_args([])
-            opts.model_num_classes = n_classes
-            opts.in_channels = args.in_channels
-            opts.classifier_augmentation = args.classifier_augmentation
-            opts.depth = args.depth
-            opts.noised = args.train_noised_classifier
-            classifier = create_resnet_classifier(opts)
-        elif args.classifier_type == "unet":
-            classifier = create_classifier(
-                args.image_size,
-                classifier_use_fp16=False,
-                classifier_width=128,
-                classifier_depth=2,
-                classifier_attention_resolutions="32,16,8",  # 16
-                classifier_use_scale_shift_norm=True,  # False
-                classifier_resblock_updown=True,  # False
-                classifier_pool="attention",
-            )
+        logger.log("creating disjoint classifier...")
+        defaults = classifier_defaults()
+        parser = argparse.ArgumentParser()
+        add_dict_to_argparser(parser, defaults)
+        opts = parser.parse_args([])
+        opts.model_num_classes = n_classes
+        opts.in_channels = args.in_channels
+        opts.depth = args.depth
+        opts.noised = args.train_noised_classifier
+        classifier = create_resnet_classifier(opts)
         classifier.to(dist_util.dev())
         # Needed for creating correct EMAs and fp16 parameters.
         dist_util.sync_params(classifier.parameters())
-        print(classifier)
 
         if args.resume_checkpoint_classifier:
             classifier.load_state_dict(
@@ -151,18 +119,19 @@ def run_training_with_args(args):
                     args.resume_checkpoint_classifier, map_location=dist_util.dev()
                 )
             )
-            print(f"loading classifier from {args.resume_checkpoint_classifier}...")
+            logger.log(
+                f"loading classifier from {args.resume_checkpoint_classifier}..."
+            )
 
     schedule_sampler = create_named_schedule_sampler(
         args.schedule_sampler, diffusion, args
     )
 
-    logger.log("creating data loader...")
-
+    logger.log("creating data loaders...")
     train_dataset_splits, _, classes_per_task = data_split(
         dataset=train_dataset,
         return_classes=True,
-        return_task_as_class=args.use_task_index,
+        return_task_as_class=False,
         num_tasks=args.num_tasks,
         num_classes=n_classes,
         limit_classes=args.limit_classes,
@@ -175,7 +144,7 @@ def run_training_with_args(args):
     val_dataset_splits, _, classes_per_task = data_split(
         dataset=val_dataset,
         return_classes=True,
-        return_task_as_class=args.use_task_index,
+        return_task_as_class=False,
         num_tasks=args.num_tasks,
         num_classes=n_classes,
         limit_classes=args.limit_classes,
@@ -186,47 +155,13 @@ def run_training_with_args(args):
     )
 
     train_loaders = []
-    validation_loaders = None
-    if not args.skip_validation:
-        validation_loaders = prepare_eval_loaders(
-            train_dataset_splits=train_dataset_splits,
-            val_dataset_splits=val_dataset_splits,
-            args=args,
-            include_train=False,
-            generator=random_generator,
-        )
-        fid_eval_loaders = prepare_eval_loaders(
-            train_dataset_splits=train_dataset_splits,
-            val_dataset_splits=val_dataset_splits,
-            args=args,
-            include_train=args.eval_fid_on_train_and_valid,
-            generator=random_generator,
-        )
-
-        #  Bump the version below if we want to invalidate all previous caches.
-        stats_file_name = (
-            f"v2_data_seed_{args.data_seed}_num_tasks_{args.num_tasks}_"
-            f"limit_classes_{args.limit_classes}_use_train_and_valid_{args.eval_fid_on_train_and_valid}"
-        )
-        if args.use_gpu_for_validation:
-            device_for_validation = dist_util.dev()
-        else:
-            device_for_validation = th.device("cpu")
-        if args.dataset.lower() != "cern":
-            validator = Validator(
-                n_classes=n_classes,
-                device=dist_util.dev(),
-                dataset=args.dataset,
-                stats_file_name=stats_file_name,
-                score_model_device=device_for_validation,
-                fid_dataloaders=fid_eval_loaders,
-                clf_dataloaders=validation_loaders,
-                force_inception_for_fid=args.force_inception_for_fid,
-            )
-        else:
-            raise NotImplementedError()  # Adapt CERN validator
-            # validator = CERN_Validator(dataloaders=val_loaders, stats_file_name=stats_file_name, device=dist_util.dev())
-
+    validation_loaders = prepare_eval_loaders(
+        train_dataset_splits=train_dataset_splits,
+        val_dataset_splits=val_dataset_splits,
+        args=args,
+        include_train=False,
+        generator=random_generator,
+    )
     test_acc_table = OrderedDict()
     train_acc_table = OrderedDict()
 
@@ -251,23 +186,15 @@ def run_training_with_args(args):
             ) + args.first_task_num_classes
 
         if task_id == 0:
-            if args.class_cond:
+            if not args.train_with_disjoint_classifier:
                 num_steps = args.first_task_num_steps
             else:
                 num_steps = args.disjoint_classifier_init_num_steps
         else:
-            if args.class_cond:
+            if not args.train_with_disjoint_classifier:
                 num_steps = args.num_steps
             else:
                 num_steps = args.disjoint_classifier_num_steps
-
-        logger.log("moving real dataset to gpu...")
-        train_dataset_splits[task_id].dataset.dataset.dataset = train_dataset_splits[
-            task_id
-        ].dataset.dataset.dataset.to(dist_util.dev())
-        train_dataset_splits[task_id].dataset.dataset.labels = train_dataset_splits[
-            task_id
-        ].dataset.dataset.labels.to(dist_util.dev())
 
         train_loop = TrainLoop(
             params=args,
@@ -286,7 +213,6 @@ def run_training_with_args(args):
             log_interval=args.log_interval,
             skip_save=args.skip_save,
             save_interval=args.save_interval,
-            plot_interval=args.plot_interval,
             resume_checkpoint=(
                 args.resume_checkpoint if task_id == args.first_task else None
             ),
@@ -298,13 +224,9 @@ def run_training_with_args(args):
             num_steps=num_steps,
             image_size=args.image_size,
             in_channels=args.in_channels,
-            class_cond=args.class_cond,
             max_class=max_class,
             global_steps_before=global_step,
             cl_method=cl_method,
-            validation_loaders=validation_loaders,
-            use_task_index=args.use_task_index,
-            scale_classes_loss=args.scale_classes_loss,
             classes_per_task=classes_per_task,
             use_ddim=args.use_ddim,
             classifier_scale_min_old=args.classifier_scale_min_old,
@@ -321,7 +243,6 @@ def run_training_with_args(args):
             diffusion_pretrained_dir=args.diffusion_pretrained_dir,
             train_transform_classifier=train_transform_classifier,
             train_transform_diffusion=train_transform_diffusion,
-            norm_grads=args.norm_grads,
             n_classes=n_classes,
             random_generator=random_generator,
             classifier_first_task_dir=args.classifier_first_task_dir,
@@ -353,16 +274,19 @@ def run_training_with_args(args):
         train_loop_time = time.time() - train_loop_start_time
         wandb_safe_log({"train_loop_time": train_loop_time}, step=global_step)
 
+        logger.log("validation...")
         test_acc_table[task_id] = OrderedDict()
         train_acc_table[task_id] = OrderedDict()
         validation_start_time = time.time()
         for j in range(task_id + 1):
             if args.train_with_disjoint_classifier:
-                clf_results = validator.calculate_accuracy_with_classifier(
+                clf_results = calculate_accuracy_with_classifier(
                     model=(
                         model if not args.train_with_disjoint_classifier else classifier
                     ),
                     task_id=j,
+                    val_loader=validation_loaders[j],
+                    device=dist_util.dev(),
                     train_loader=(
                         train_loaders[j - args.first_task]
                         if j >= args.first_task
@@ -396,10 +320,21 @@ def run_training_with_args(args):
                 ),
             )
         train_loop.prev_ddp_model = copy.deepcopy(model)
-    print("TEST ACCURACY TABLE:")
-    print(test_acc_table)
-    print("TRAIN ACCURACY TABLE:")
-    print(train_acc_table)
+    logger.log("TEST ACCURACY TABLE:")
+    logger.log(test_acc_table)
+    logger.log("TRAIN ACCURACY TABLE:")
+    logger.log(train_acc_table)
+
+
+def seed_everything(seed):
+    th.manual_seed(seed)
+    np.random.seed(seed)
+    th.cuda.manual_seed(seed)
+    th.backends.cudnn.deterministic = True
+    th.backends.cudnn.benchmark = False
+    random_generator = th.Generator()
+    random_generator.manual_seed(seed)
+    return random_generator
 
 
 def create_argparser():

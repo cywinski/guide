@@ -1,4 +1,4 @@
-guided_diffusion.egg-info/
+guide.egg-info/
 .DS_Store
 __pycache__/
 classify_image_graph_def.pb
@@ -14,7 +14,6 @@ slurm_out
 *.csv
 .ipynb_checkpoints
 *.ipynb
-*.png
 *.gif
 *.npz
 results*/

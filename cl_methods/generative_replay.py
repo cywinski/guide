@@ -4,8 +4,8 @@ from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
 from cl_methods.base import CLMethod
 from dataloaders.utils import yielder
 from dataloaders.wrapper import AppendName
-from guided_diffusion import dist_util
-from guided_diffusion.logger import get_rank_without_mpi_import, log_generated_examples
+from guide import dist_util
+from guide.logger import get_rank_without_mpi_import, log_generated_examples
 
 
 class GenerativeReplay(CLMethod):
@@ -44,13 +44,6 @@ class GenerativeReplay(CLMethod):
                 use_old_grad=False,
                 use_new_grad=False,
             )
-            print("moving generated dataset to gpu...")
-            generated_previous_examples = generated_previous_examples.to(
-                dist_util.dev()
-            )
-            generated_previous_examples_labels = generated_previous_examples_labels.to(
-                dist_util.dev()
-            )
             generated_dataset = AppendName(
                 TensorDataset(
                     generated_previous_examples, generated_previous_examples_labels
@@ -82,28 +75,3 @@ class GenerativeReplay(CLMethod):
             train_dataset_loader,
             generated_previous_examples if task_id != 0 else None,
         )
-
-    def get_additional_losses(self, train_loop, x, cond, t, x_t, t_scaled):
-        if self.args.gr_generate_previous_samples_continuously and (
-            train_loop.task_id > 0
-        ):
-            shape = [
-                train_loop.batch_size,
-                train_loop.in_channels,
-                train_loop.image_size,
-                train_loop.image_size,
-            ]
-            prev_loss = train_loop.diffusion.calculate_loss_previous_task(
-                current_model=train_loop.ddp_model,
-                prev_model=train_loop.prev_ddp_model,  # Frozen copy of the model
-                schedule_sampler=train_loop.schedule_sampler,
-                task_id=train_loop.task_id,
-                n_examples_per_task=train_loop.batch_size,
-                shape=shape,
-                batch_size=train_loop.microbatch,
-                clip_denoised=train_loop.params.clip_denoised,
-            )
-
-            return prev_loss, {"prev_loss": prev_loss}
-        else:
-            return 0, {}

@@ -12,18 +12,13 @@ import numpy as np
 import torch as th
 import torch.nn.functional as F
 
-from guided_diffusion import dist_util, logger
-from guided_diffusion.script_args import (
-    add_dict_to_argparser,
-    args_to_dict,
-    classifier_defaults,
-)
-from guided_diffusion.script_util import (
-    model_and_diffusion_defaults,
+from guide import dist_util, logger
+from guide.script_args import add_dict_to_argparser, args_to_dict, classifier_defaults
+from guide.script_util import (
     create_model_and_diffusion,
     create_resnet_classifier,
+    model_and_diffusion_defaults,
 )
-
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -35,7 +30,7 @@ def main():
     th.cuda.manual_seed(args.seed)
     th.backends.cudnn.deterministic = True
     th.backends.cudnn.benchmark = False
-    os.environ["OPENAI_LOGDIR"] = f"out/samples/{args.experiment_name}"
+    os.environ["OPENAI_LOGDIR"] = f"out/samples/{args.wandb_experiment_name}"
 
     assert args.num_samples % args.batch_size == 0
 
@@ -123,7 +118,11 @@ def main():
             (args.batch_size, args.in_channels, args.image_size, args.image_size),
             clip_denoised=True,
             model_kwargs=model_kwargs,
-            cond_fn=(None if args.classifier_scale_min == 0.0 and args.classifier_scale_max == 0.0 else cond_fn),
+            cond_fn=(
+                None
+                if args.classifier_scale_min == 0.0 and args.classifier_scale_max == 0.0
+                else cond_fn
+            ),
             device=dist_util.dev(),
         )
         sample = ((sample + 1) * 127.5).clamp(0, 255)
@@ -141,7 +140,7 @@ def main():
     label_arr = all_labels
     label_arr = label_arr[: args.num_samples]
     out_path = os.path.join(
-        os.path.dirname(args.model_path), f"{args.experiment_name}.npz"
+        os.path.dirname(args.model_path), f"{args.wandb_experiment_name}.npz"
     )
     logger.log(f"saving to {out_path}")
     np.savez(out_path, arr, label_arr)
@@ -160,9 +159,8 @@ def create_argparser():
         classifier_path="",
         classifier_scale_min=0.0,
         classifier_scale_max=0.0,
-        experiment_name="test",
+        wandb_experiment_name="test",
         model_num_classes=10,
-        class_cond=True,
         trim_logits=True,
         min_class_sample=0,
         max_class_sample=0,
