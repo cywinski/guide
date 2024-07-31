@@ -354,7 +354,7 @@ def ImageNet100128(
     )
 
 
-def ImageNet100_224(
+def ImageNet100_256(
     dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False
 ):
     train_transform_clf = None
@@ -366,7 +366,7 @@ def ImageNet100_224(
         )
 
     print("Loading data")
-    save_path = f"{dataroot}/fast_imagenet100224_train"
+    save_path = f"{dataroot}/fast_imagenet100256_train"
     if os.path.exists(save_path):
         fast_imagenet_train = torch.load(save_path)
     else:
@@ -376,8 +376,8 @@ def ImageNet100_224(
             root=os.path.join(dataroot, "imagenet100", "train"),
             transform=transforms.Compose(
                 [
-                    transforms.Resize((280, 280)),
-                    transforms.CenterCrop((224, 224)),
+                    transforms.Resize((304, 304)),
+                    transforms.CenterCrop((256, 256)),
                     transforms.ToTensor(),
                     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
                 ]
@@ -393,8 +393,8 @@ def ImageNet100_224(
             root=os.path.join(dataroot, "imagenet100", "val"),
             transform=transforms.Compose(
                 [
-                    transforms.Resize((280, 280)),
-                    transforms.CenterCrop((224, 224)),
+                    transforms.Resize((304, 304)),
+                    transforms.CenterCrop((256, 256)),
                     transforms.ToTensor(),
                     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
                 ]
@@ -412,7 +412,7 @@ def ImageNet100_224(
         fast_imagenet_train = FastDataset(data[0], data[1])
         torch.save(fast_imagenet_train, save_path)
 
-    save_path = f"{dataroot}/fast_imagenet100224_val"
+    save_path = f"{dataroot}/fast_imagenet100256_val"
     if os.path.exists(save_path):
         fast_imagenet_val = torch.load(save_path)
     else:
@@ -424,7 +424,7 @@ def ImageNet100_224(
     return (
         fast_imagenet_train,
         fast_imagenet_val,
-        224,
+        256,
         3,
         train_transform_clf,
         train_transform_diff,
