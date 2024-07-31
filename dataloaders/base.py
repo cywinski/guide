@@ -352,3 +352,81 @@ def ImageNet100128(
         train_transform_diff,
         100,
     )
+
+
+def ImageNet100_224(
+    dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False
+):
+    train_transform_clf = None
+    train_transform_diff = None
+    # augmentation for diffusion training
+    if train_aug:
+        train_transform_diff = K.augmentation.ImageSequential(
+            K.augmentation.RandomHorizontalFlip(),
+        )
+
+    print("Loading data")
+    save_path = f"{dataroot}/fast_imagenet100224_train"
+    if os.path.exists(save_path):
+        fast_imagenet_train = torch.load(save_path)
+    else:
+        target_transform = transforms.Lambda(lambda y: torch.eye(100)[y])
+
+        train_dataset = torchvision.datasets.ImageFolder(
+            root=os.path.join(dataroot, "imagenet100", "train"),
+            transform=transforms.Compose(
+                [
+                    transforms.Resize((280, 280)),
+                    transforms.CenterCrop((224, 224)),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                ]
+            ),
+            target_transform=target_transform,
+        )
+        train_dataset = CacheClassLabel(
+            train_dataset,
+            target_transform=target_transform,
+        )
+
+        val_dataset = torchvision.datasets.ImageFolder(
+            root=os.path.join(dataroot, "imagenet100", "val"),
+            transform=transforms.Compose(
+                [
+                    transforms.Resize((280, 280)),
+                    transforms.CenterCrop((224, 224)),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                ]
+            ),
+            target_transform=target_transform,
+        )
+
+        val_dataset = CacheClassLabel(
+            val_dataset,
+            target_transform=target_transform,
+        )
+
+        train_loader = DataLoader(train_dataset, batch_size=len(train_dataset))
+        data = next(iter(train_loader))
+        fast_imagenet_train = FastDataset(data[0], data[1])
+        torch.save(fast_imagenet_train, save_path)
+
+    save_path = f"{dataroot}/fast_imagenet100224_val"
+    if os.path.exists(save_path):
+        fast_imagenet_val = torch.load(save_path)
+    else:
+        val_loader = DataLoader(val_dataset, batch_size=len(val_dataset))
+        data = next(iter(val_loader))
+        fast_imagenet_val = FastDataset(data[0], data[1])
+        torch.save(fast_imagenet_val, save_path)
+
+    return (
+        fast_imagenet_train,
+        fast_imagenet_val,
+        224,
+        3,
+        train_transform_clf,
+        train_transform_diff,
+        100,
+    )
