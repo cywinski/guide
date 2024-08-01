@@ -114,7 +114,7 @@ def create_model(
             channel_mult = (0.5, 1, 1, 2, 2, 4, 4)
         elif image_size == 256:
             channel_mult = (1, 1, 2, 2, 4, 4)
-        elif image_size == 128:
+        elif image_size in {128, 224}:
             channel_mult = (1, 1, 2, 3, 4)
         elif image_size == 64:
             channel_mult = (1, 2, 3, 4)
@@ -221,7 +221,7 @@ def create_classifier(
         channel_mult = (0.5, 1, 1, 2, 2, 4, 4)
     elif image_size == 256:
         channel_mult = (1, 1, 2, 2, 4, 4)
-    elif image_size == 128:
+    elif image_size in {128, 224}:
         channel_mult = (1, 1, 2, 3, 4)
     elif image_size == 64:
         channel_mult = (1, 2, 3, 4)

@@ -352,3 +352,108 @@ def ImageNet100128(
         train_transform_diff,
         100,
     )
+
+
+def Flowers102(
+    dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False
+):
+    train_transform_clf = None
+    train_transform_diff = None
+    # augmentation for diffusion training
+    if train_aug:
+        train_transform_diff = K.augmentation.ImageSequential(
+            K.augmentation.RandomHorizontalFlip(),
+        )
+
+    # augmentation for classifier training
+    # if classifier_augmentation:
+    #     train_transform_clf = K.augmentation.ImageSequential(
+    #         K.augmentation.Denormalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    #         K.augmentation.RandomCrop((32, 32), padding=4),
+    #         K.augmentation.RandomRotation(30),
+    #         K.augmentation.RandomHorizontalFlip(),
+    #         K.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1),
+    #         K.augmentation.RandomErasing(scale=(0.1, 0.5)),
+    #         K.augmentation.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    #     )
+
+    target_transform = transforms.Lambda(lambda y: torch.eye(102)[y])
+
+    train_dataset1 = torchvision.datasets.Flowers102(
+        root=dataroot,
+        split="train",
+        download=True,
+        transform=transforms.Compose(
+            [
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]
+        ),
+        target_transform=target_transform,
+    )
+    train_dataset2 = torchvision.datasets.Flowers102(
+        root=dataroot,
+        split="val",
+        download=True,
+        transform=transforms.Compose(
+            [
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]
+        ),
+        target_transform=target_transform,
+    )
+    train_dataset = torch.utils.data.ConcatDataset([train_dataset1, train_dataset2])
+    train_dataset.root = dataroot
+    train_dataset = CacheClassLabel(
+        train_dataset,
+        target_transform=target_transform,
+    )
+    val_dataset = torchvision.datasets.Flowers102(
+        root=dataroot,
+        split="test",
+        download=True,
+        transform=transforms.Compose(
+            [
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]
+        ),
+        target_transform=target_transform,
+    )
+    val_dataset = CacheClassLabel(
+        val_dataset,
+        target_transform=target_transform,
+    )
+
+    print("Loading data")
+    save_path = f"{dataroot}/fast_flowers_train"
+    if os.path.exists(save_path):
+        fast_flowers_train = torch.load(save_path)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=len(train_dataset))
+        data = next(iter(train_loader))
+        fast_flowers_train = FastDataset(data[0], data[1])
+        torch.save(fast_flowers_train, save_path)
+
+    save_path = f"{dataroot}/fast_flowers_val"
+    if os.path.exists(save_path):
+        fast_flowers_val = torch.load(save_path)
+    else:
+        val_loader = DataLoader(val_dataset, batch_size=len(val_dataset))
+        data = next(iter(val_loader))
+        fast_flowers_val = FastDataset(data[0], data[1])
+        torch.save(fast_flowers_val, save_path)
+
+    return (
+        fast_flowers_train,
+        fast_flowers_val,
+        224,
+        3,
+        train_transform_clf,
+        train_transform_diff,
+        102,
+    )
