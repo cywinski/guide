@@ -442,16 +442,14 @@ def Flowers102(
         )
 
     # augmentation for classifier training
-    # if classifier_augmentation:
-    #     train_transform_clf = K.augmentation.ImageSequential(
-    #         K.augmentation.Denormalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    #         K.augmentation.RandomCrop((32, 32), padding=4),
-    #         K.augmentation.RandomRotation(30),
-    #         K.augmentation.RandomHorizontalFlip(),
-    #         K.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1),
-    #         K.augmentation.RandomErasing(scale=(0.1, 0.5)),
-    #         K.augmentation.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    #     )
+    if classifier_augmentation:
+        train_transform_clf = K.augmentation.ImageSequential(
+            K.augmentation.Denormalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            K.augmentation.RandomRotation(30),
+            K.augmentation.RandomHorizontalFlip(),
+            K.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1),
+            K.augmentation.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        )
 
     target_transform = transforms.Lambda(lambda y: torch.eye(102)[y])
 
