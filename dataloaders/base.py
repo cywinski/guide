@@ -1,5 +1,5 @@
 import os
-
+import numpy as np
 import kornia as K
 import torch
 import torchvision
@@ -530,4 +530,79 @@ def Flowers102(
         train_transform_clf,
         train_transform_diff,
         102,
+    )
+
+def CUB200(dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False):
+    train_test_split_file = os.path.join(dataroot, 'train_test_split.txt')
+    train_test_split = np.loadtxt(train_test_split_file, dtype=int)
+    train_test_split = train_test_split[:, 1]
+
+    train_transform_clf = None
+    train_transform_diff = None
+    # augmentation for diffusion training
+    if train_aug:
+        train_transform_diff = K.augmentation.ImageSequential(
+            K.augmentation.RandomHorizontalFlip(),
+        )
+
+    # augmentation for classifier training
+    if classifier_augmentation:
+        train_transform_clf = K.augmentation.ImageSequential(
+            K.augmentation.Denormalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            K.augmentation.RandomRotation(30),
+            K.augmentation.RandomHorizontalFlip(),
+            K.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1),
+            K.augmentation.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        )
+    target_transform = transforms.Lambda(lambda y: torch.eye(1200)[y+1000])
+    dataset = torchvision.datasets.ImageFolder(
+        root=os.path.join(dataroot, "images"),
+        transform=transforms.Compose(
+                [
+                    transforms.Resize((64, 64)),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                ]
+            ),
+            target_transform=target_transform,)
+
+    print("Loading data")
+    save_path = f"{dataroot}/fast_cub200_train"
+    if os.path.exists(save_path):
+        fast_cub_train = torch.load(save_path)
+    else:
+        train_dataset = torch.utils.data.Subset(dataset, np.where(train_test_split == 0)[0])
+        train_dataset.root = dataroot
+        train_dataset = CacheClassLabel(
+                train_dataset,
+                target_transform=target_transform,
+            )
+        train_loader = DataLoader(train_dataset, batch_size=len(train_dataset))
+        data = next(iter(train_loader))
+        fast_cub_train = FastDataset(data[0], data[1])
+        torch.save(fast_cub_train, save_path)
+
+    save_path = f"{dataroot}/fast_cub200_val"
+    if os.path.exists(save_path):
+        fast_cub_val = torch.load(save_path)
+    else:
+        val_dataset = torch.utils.data.Subset(dataset, np.where(train_test_split == 1)[0])
+        val_dataset.root = dataroot
+        val_dataset = CacheClassLabel(
+                val_dataset,
+                target_transform=target_transform,
+            )
+        val_loader = DataLoader(val_dataset, batch_size=len(val_dataset))
+        data = next(iter(val_loader))
+        fast_cub_val = FastDataset(data[0], data[1])
+        torch.save(fast_cub_val, save_path)
+
+    return (
+        fast_cub_train,
+        fast_cub_val,
+        64,
+        3,
+        train_transform_clf,
+        train_transform_diff,
+        1200,
     )
