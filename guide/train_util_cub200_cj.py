@@ -85,6 +85,7 @@ class TrainLoop:
         train_noised_classifier=None,
         val_loader_imagenet=None,
         val_loader_cub=None,
+        train_yielder_imagenet=None,
     ):
         self.params = params
         self.task_id = task_id
@@ -160,21 +161,6 @@ class TrainLoop:
         self.global_batch = self.batch_size * dist.get_world_size()
 
         self.sync_cuda = th.cuda.is_available()
-
-        self._load_and_sync_parameters()
-        self.mp_trainer = MixedPrecisionTrainer(
-            model=self.model,
-            use_fp16=self.use_fp16,
-            fp16_scale_growth=fp16_scale_growth,
-        )
-
-        self.opt = AdamW(
-            self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
-        )
-
-        self.scheduler = th.optim.lr_scheduler.ExponentialLR(
-            self.opt, gamma=scheduler_rate
-        )
         self.scheduler_step = scheduler_step
         self.classifier_first_task_dir = classifier_first_task_dir
 
@@ -197,30 +183,8 @@ class TrainLoop:
             )
             self.num_batches_per_epoch = len(self.data) // (self.batch_size//2)
 
-        if self.resume_step:
-            self._load_optimizer_state()
-            # Model was resumed, either due to a restart or a checkpoint
-            # being specified at the command line.
-            self.ema_params = [
-                self._load_ema_parameters(rate) for rate in self.ema_rate
-            ]
-        else:
-            self.ema_params = [
-                copy.deepcopy(self.mp_trainer.master_params)
-                for _ in range(len(self.ema_rate))
-            ]
-
         if th.cuda.is_available():
             self.use_ddp = True
-            self.prev_ddp_model = DDP(
-                self.prev_model,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
-            )
-            self.prev_ddp_model.eval()
             if self.disjoint_classifier is not None:
                 self.disjoint_classifier = DDP(
                     self.disjoint_classifier,
@@ -239,16 +203,6 @@ class TrainLoop:
                     find_unused_parameters=False,
                 )
                 self.prev_disjoint_classifier.eval()
-            else:
-                # NOTE: We need current diffusion only if we are not training classifier
-                self.ddp_model = DDP(
-                    self.model,
-                    device_ids=[dist_util.dev()],
-                    output_device=dist_util.dev(),
-                    broadcast_buffers=False,
-                    bucket_cap_mb=128,
-                    find_unused_parameters=False,
-                )
 
         else:
             if dist.get_world_size() > 1:
@@ -264,6 +218,7 @@ class TrainLoop:
         self.cl_method = cl_method
         self.val_loader_imagenet = val_loader_imagenet
         self.val_loader_cub = val_loader_cub
+        self.train_yielder_imagenet = train_yielder_imagenet
 
     def _load_and_sync_parameters(self):
         prev_resume_checkpoint = None
@@ -407,28 +362,7 @@ class TrainLoop:
                         prev_generations is None
                         or (self.step - 1) % self.guid_generation_interval == 0
                     ):
-                        # Generate replay examples and shuffle them with the real ones.
-                        self.disjoint_classifier.eval()
-                        sampling_start = time.time()
-                        (
-                            generated_previous_examples,
-                            generated_previous_labels,
-                            generated_previous_examples_confidences,
-                        ) = self.generate_examples(
-                            self.task_id - 1,
-                            (self.batch_size // 2),
-                            batch_size=-1,
-                            equal_n_examples_per_class=True,
-                            use_old_grad=self.use_old_grad,
-                            use_new_grad=self.use_new_grad,
-                            only_one_task=True,
-                            real_examples=real_examples,  # needed for speedup generation
-                        )
-                        sampling_time += time.time() - sampling_start
-                        prev_generations = generated_previous_examples.cpu()
-                        prev_generations_labels = (
-                            generated_previous_labels.cpu()
-                        )
+                        prev_generations, prev_generations_labels = next(self.train_yielder_imagenet) # classes [0, 1000]
                     else:
                         generated_previous_examples = prev_generations
                         generated_previous_labels = prev_generations_labels
@@ -439,28 +373,18 @@ class TrainLoop:
                             real_cond
                         ], dim=1
                     )
+                    extended_generation_labels = th.cat(
+                        [
+                            generated_previous_labels,
+                            th.zeros(generated_previous_labels.size(0), 200, device=generated_previous_labels.device),
+                        ], dim=1
+                    )
                     cond = {
-                        "y": th.cat([generated_previous_labels, extended_real_cond], dim=0)
+                        "y": th.cat([extended_generation_labels, extended_real_cond], dim=0)
                     }
                     shuffle = th.randperm(batch.shape[0])
                     batch = batch[shuffle]
                     cond["y"] = cond["y"][shuffle]
-                    if (
-                        logger.get_rank_without_mpi_import() == 0
-                        and (self.step - 1) % self.log_interval == 0
-                    ):
-                        logger.log_generated_examples(
-                            generated_previous_examples,
-                            th.argmax(generated_previous_labels, 1),
-                            generated_previous_examples_confidences,
-                            self.task_id,
-                            n_examples_to_log=(
-                                (self.batch_size // (self.task_id + 1))
-                            )
-                            // (self.classes_per_task),
-                            step=self.get_global_step(),
-                        )
-
                     self.disjoint_classifier.train()
 
                     # apply transforms here so that they are applied both to real images and generations

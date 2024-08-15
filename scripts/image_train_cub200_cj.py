@@ -37,7 +37,7 @@ from guide.script_util import (
 )
 from dataloaders.utils import yielder
 
-from guide.train_util_cub200 import TrainLoop
+from guide.train_util_cub200_cj import TrainLoop
 import torch.distributed as dist
 
 # os.environ["WANDB_MODE"] = "disabled"
@@ -136,17 +136,6 @@ def run_training_with_args(args):
     args.in_channels = image_channels
     args.model_num_classes = 1000
 
-    logger.log("creating model and diffusion...")
-    model, diffusion = create_model_and_diffusion(
-        **args_to_dict(args, model_and_diffusion_defaults().keys())
-    )
-
-    if args.log_gradient_stats and not os.environ.get("WANDB_MODE") == "disabled":
-        wandb.watch(model, log_freq=10)
-    # if we are not training diffusion, we will not need this model
-    if not args.train_with_disjoint_classifier:
-        model.to(dist_util.dev())
-
     logger.log("Loading pretrained ResNet18 model...")
     classifier = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
     # Get the number of features in the last layer
@@ -171,10 +160,6 @@ def run_training_with_args(args):
     classifier.to(dist_util.dev())
     dist_util.sync_params(classifier.parameters())
 
-    schedule_sampler = create_named_schedule_sampler(
-        args.schedule_sampler, diffusion, args
-    )
-
     val_loader_cub = th.utils.data.DataLoader(
             dataset=val_dataset_cub,
             batch_size=args.batch_size,
@@ -198,6 +183,15 @@ def run_training_with_args(args):
         )
     dataset_yielder = yielder(train_loader)
 
+    train_loader_imagenet = th.utils.data.DataLoader(
+            dataset=train_dataset_imagenet,
+            batch_size=args.batch_size // 2,
+            shuffle=True,
+            drop_last=True,
+            generator=random_generator,
+        )
+    dataset_yielder_imagenet = yielder(train_loader_imagenet)
+
     train_loop = None
     cl_method = get_cl_method(args)
     global_step = 0
@@ -205,9 +199,9 @@ def run_training_with_args(args):
 
     train_loop = TrainLoop(
         params=args,
-        model=model,
-        prev_model=copy.deepcopy(model).to(dist_util.dev()),
-        diffusion=diffusion,
+        model=None,
+        prev_model=None,
+        diffusion=None,
         task_id=1,
         data=train_dataset_cub,
         data_yielder=dataset_yielder,
@@ -225,7 +219,7 @@ def run_training_with_args(args):
         ),
         use_fp16=args.use_fp16,
         fp16_scale_growth=args.fp16_scale_growth,
-        schedule_sampler=schedule_sampler,
+        schedule_sampler=None,
         weight_decay=args.weight_decay,
         lr_anneal_steps=args.lr_anneal_steps,
         num_steps=num_steps,
@@ -256,6 +250,7 @@ def run_training_with_args(args):
         train_noised_classifier=args.train_noised_classifier,
         val_loader_imagenet=val_loader_imagenet,
         val_loader_cub=val_loader_cub,
+        train_yielder_imagenet=dataset_yielder_imagenet,
     )
 
     train_loop_start_time = time.time()

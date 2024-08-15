@@ -539,29 +539,26 @@ def CUB200(dataroot, skip_normalization=False, train_aug=False, classifier_augme
 
     train_transform_clf = None
     train_transform_diff = None
-    # augmentation for diffusion training
-    if train_aug:
-        train_transform_diff = K.augmentation.ImageSequential(
-            K.augmentation.RandomHorizontalFlip(),
-        )
+    mean = [0.485, 0.456, 0.406]
+    std=[0.229, 0.224, 0.225]
 
     # augmentation for classifier training
     if classifier_augmentation:
         train_transform_clf = K.augmentation.ImageSequential(
-            K.augmentation.Denormalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            K.augmentation.Denormalize(mean, std),
             K.augmentation.RandomRotation(30),
             K.augmentation.RandomHorizontalFlip(),
             K.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1),
-            K.augmentation.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            K.augmentation.Normalize(mean, std),
         )
-    target_transform = transforms.Lambda(lambda y: torch.eye(1200)[y+1000])
+    target_transform = transforms.Lambda(lambda y: torch.eye(200)[y])
     dataset = torchvision.datasets.ImageFolder(
         root=os.path.join(dataroot, "images"),
         transform=transforms.Compose(
                 [
-                    transforms.Resize((64, 64)),
+                    transforms.Resize((256, 256)),
                     transforms.ToTensor(),
-                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                    transforms.Normalize(mean, std),
                 ]
             ),
             target_transform=target_transform,)
@@ -600,9 +597,45 @@ def CUB200(dataroot, skip_normalization=False, train_aug=False, classifier_augme
     return (
         fast_cub_train,
         fast_cub_val,
-        64,
+        256,
         3,
         train_transform_clf,
         train_transform_diff,
-        1200,
+        200,
+    )
+
+def ImageNet(dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False):
+    target_transform = transforms.Lambda(lambda y: torch.eye(1000)[y])
+    mean = [0.485, 0.456, 0.406]
+    std=[0.229, 0.224, 0.225]
+
+    train_dataset = torchvision.datasets.ImageFolder(
+        root=os.path.join(dataroot, "train"),
+        transform=transforms.Compose(
+                [
+                    transforms.Resize((256, 256)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean, std),
+                ]
+            ),
+            target_transform=target_transform,)
+    val_dataset = torchvision.datasets.ImageFolder(
+        root=os.path.join(dataroot, "val"),
+        transform=transforms.Compose(
+                [
+                    transforms.Resize((256, 256)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean, std),
+                ]
+            ),
+            target_transform=target_transform,)
+
+    return (
+        train_dataset,
+        val_dataset,
+        256,
+        3,
+        None,
+        None,
+        1000,
     )
