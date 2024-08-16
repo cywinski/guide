@@ -1,5 +1,6 @@
-import math
 from abc import abstractmethod
+
+import math
 
 import numpy as np
 import torch as th
@@ -8,13 +9,13 @@ import torch.nn.functional as F
 
 from .fp16_util import convert_module_to_f16, convert_module_to_f32
 from .nn import (
-    avg_pool_nd,
     checkpoint,
     conv_nd,
     linear,
+    avg_pool_nd,
+    zero_module,
     normalization,
     timestep_embedding,
-    zero_module,
 )
 
 
@@ -98,8 +99,6 @@ class Upsample(nn.Module):
 
     def forward(self, x):
         assert x.shape[1] == self.channels
-        # if x.shape[2] == 1:
-        #     return x
         if self.dims == 3:
             x = F.interpolate(
                 x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest"
@@ -433,7 +432,6 @@ class UNetModel(nn.Module):
         out_channels,
         num_res_blocks,
         attention_resolutions,
-        embedding_kind,
         dropout=0,
         channel_mult=(1, 2, 4, 8),
         conv_resample=True,
@@ -447,8 +445,6 @@ class UNetModel(nn.Module):
         use_scale_shift_norm=False,
         resblock_updown=False,
         use_new_attention_order=False,
-        model_switching_timestep=None,
-        classifier_augmentation=True,
     ):
         super().__init__()
 
@@ -464,27 +460,22 @@ class UNetModel(nn.Module):
         self.dropout = dropout
         self.channel_mult = channel_mult
         self.conv_resample = conv_resample
-        self.num_classes = int(num_classes)
+        self.num_classes = num_classes
         self.use_checkpoint = use_checkpoint
         self.dtype = th.float16 if use_fp16 else th.float32
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
 
-        self.embedding_kind = embedding_kind
-
         time_embed_dim = model_channels * 4
-        self.time_embed = self._get_time_embedding(time_embed_dim)
+        self.time_embed = nn.Sequential(
+            linear(model_channels, time_embed_dim),
+            nn.SiLU(),
+            linear(time_embed_dim, time_embed_dim),
+        )
 
-        if embedding_kind != "none":
-            # Keep in mind that this is learned even for previous tasks.
-            # TODO: add option to partially freeze embeddings.
-            if embedding_kind == "add_time_learned":
-                self.label_emb = nn.Embedding(num_classes, time_embed_dim)
-            elif embedding_kind == "concat_time_1hot":
-                self.label_emb = lambda x: F.one_hot(x.long(), self.num_classes)
-            else:
-                assert False, "bad embedding kind!"
+        if self.num_classes is not None:
+            self.label_emb = nn.Embedding(num_classes, time_embed_dim)
 
         ch = input_ch = int(channel_mult[0] * model_channels)
         self.input_blocks = nn.ModuleList(
@@ -600,7 +591,6 @@ class UNetModel(nn.Module):
                     )
                 if level and i == num_res_blocks:
                     out_ch = ch
-                    up = self.image_size > 1
                     layers.append(
                         ResBlock(
                             ch,
@@ -610,9 +600,9 @@ class UNetModel(nn.Module):
                             dims=dims,
                             use_checkpoint=use_checkpoint,
                             use_scale_shift_norm=use_scale_shift_norm,
-                            up=up,
+                            up=True,
                         )
-                        if resblock_updown or self.image_size == 1
+                        if resblock_updown
                         else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
                     )
                     ds //= 2
@@ -650,93 +640,27 @@ class UNetModel(nn.Module):
         :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x C x ...] Tensor of outputs.
         """
-        # assert (y is not None) == (
-        #     self.num_classes is not None
-        # ), "must specify y if and only if the model is class-conditional"
-        # if self.embedding_kind != "none":
-        #     assert y is not None
+        assert (y is not None) == (
+            self.num_classes is not None
+        ), "must specify y if and only if the model is class-conditional"
 
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
 
-        if self.embedding_kind != "none":
+        if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
-            emb = self._add_label_embedding(emb, y)
+            emb = emb + self.label_emb(y)
 
         h = x.type(self.dtype)
         for module in self.input_blocks:
             h = module(h, emb)
             hs.append(h)
         h = self.middle_block(h, emb)
-        for i, module in enumerate(self.output_blocks):
+        for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb)
         h = h.type(x.dtype)
         return self.out(h)
-
-    def _get_time_embedding(self, time_embed_dim):
-        dim_mid = time_embed_dim
-        if self.embedding_kind == "concat_time_1hot" and self.num_classes is not None:
-            dim_out = time_embed_dim - self.num_classes
-        else:
-            dim_out = time_embed_dim
-
-        return nn.Sequential(
-            linear(self.model_channels, dim_mid),
-            nn.SiLU(),
-            linear(time_embed_dim, dim_out),
-        )
-
-    def _add_label_embedding(self, emb, y):
-        if self.embedding_kind == "add_time_learned":
-            emb = emb + self.label_emb(y)
-        elif self.embedding_kind == "concat_time_1hot":
-            emb = th.cat([emb, self.label_emb(y)], 1)
-        else:
-            assert False, "bad embedding kind!"
-        return emb
-
-    def partial_forward(self, x, timesteps, y=None):
-        """
-        Get the internal representations from the model.
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param timesteps: a 1-D batch of timesteps.
-        :param y: an [N] Tensor of labels, if class-conditional.
-        :return: an [N x C x ...] Tensor of outputs.
-        """
-
-        hs = []
-        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
-
-        if self.embedding_kind != "none":
-            assert y.shape == (x.shape[0],)
-            emb = self._add_label_embedding(emb, y)
-
-        h = x.type(self.dtype)
-        for module in self.input_blocks:
-            h = module(h, emb)
-            hs.append(h)
-        h = self.middle_block(h, emb)
-        return h, hs
-
-    def finalise_forward(self, h, hs, timesteps):
-        """
-        Put the internal representations through the decoding part of the model.
-        """
-        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
-
-        for module in self.output_blocks:
-            h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb)
-        return self.out(h)
-
-    def classify(self, x, t=None, augmentation=False, noised=False):
-        if t is None:
-            t = th.zeros(x.size(0)).to(x.device)
-        if augmentation:
-            x = self.augmentation(x)
-        internal_representations, hs = self.partial_forward(x, t)
-        return self.classifier(internal_representations, hs, t)
 
 
 class SuperResModel(UNetModel):
@@ -944,7 +868,7 @@ class EncoderUNetModel(nn.Module):
         self.input_blocks.apply(convert_module_to_f32)
         self.middle_block.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps=None):
+    def forward(self, x, timesteps):
         """
         Apply the model to an input batch.
 
@@ -952,8 +876,6 @@ class EncoderUNetModel(nn.Module):
         :param timesteps: a 1-D batch of timesteps.
         :return: an [N x K] Tensor of outputs.
         """
-        if timesteps is None:
-            timesteps = th.zeros(x.size(0)).to(x.device)
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
 
         results = []

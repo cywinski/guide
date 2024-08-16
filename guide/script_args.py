@@ -8,7 +8,6 @@ def diffusion_defaults():
     """
     return dict(
         learn_sigma=False,
-        sigma_small=False,
         diffusion_steps=1000,
         noise_schedule="linear",
         timestep_respacing="",
@@ -48,6 +47,7 @@ def model_and_diffusion_defaults():
     Defaults for image training.
     """
     res = dict(
+        image_size=32,
         num_channels=128,
         num_res_blocks=3,
         num_heads=4,
@@ -55,18 +55,14 @@ def model_and_diffusion_defaults():
         num_head_channels=-1,
         attention_resolutions="16,8",
         channel_mult="",
-        dropout=0.1,
+        dropout=0.0,
         use_checkpoint=False,
         use_scale_shift_norm=True,
         resblock_updown=False,
         use_fp16=False,
         use_new_attention_order=False,
-        image_size=32,
-        in_channels=3,
-        model_switching_timestep=30,
-        model_name="UNetModel",
-        embedding_kind="concat_time_1hot",  # embedding used for time and "class", possible values in EMBEDDING_KINDS
         model_num_classes=None,
+        in_channels=3,
         train_noised_classifier=False,
     )
     res.update(diffusion_defaults())
@@ -175,7 +171,6 @@ def preprocess_args(args):
     """Perform simple validity checks and do a simple initial processing of training args."""
 
     assert args.cl_method in CL_METHODS
-    assert args.embedding_kind in EMBEDDING_KINDS
 
     if args.first_task_num_steps == -1:
         args.first_task_num_steps = args.num_steps

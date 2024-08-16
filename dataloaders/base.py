@@ -533,7 +533,9 @@ def Flowers102(
     )
 
 def CUB200(dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False):
-    train_test_split_file = os.path.join(dataroot, 'train_test_split.txt')
+    train_test_split_file = os.path.join(
+        dataroot, "CUB_200_2011", "train_test_split.txt"
+    )
     train_test_split = np.loadtxt(train_test_split_file, dtype=int)
     train_test_split = train_test_split[:, 1]
 
@@ -553,50 +555,26 @@ def CUB200(dataroot, skip_normalization=False, train_aug=False, classifier_augme
         )
     target_transform = transforms.Lambda(lambda y: torch.eye(200)[y])
     dataset = torchvision.datasets.ImageFolder(
-        root=os.path.join(dataroot, "images"),
+        root=os.path.join(dataroot, "CUB_200_2011", "images"),
         transform=transforms.Compose(
-                [
-                    transforms.Resize((256, 256)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean, std),
-                ]
-            ),
-            target_transform=target_transform,)
+            [
+                transforms.Resize((256, 256)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ]
+        ),
+        target_transform=target_transform,
+    )
 
-    print("Loading data")
-    save_path = f"{dataroot}/fast_cub200_train"
-    if os.path.exists(save_path):
-        fast_cub_train = torch.load(save_path)
-    else:
-        train_dataset = torch.utils.data.Subset(dataset, np.where(train_test_split == 0)[0])
-        train_dataset.root = dataroot
-        train_dataset = CacheClassLabel(
-                train_dataset,
-                target_transform=target_transform,
-            )
-        train_loader = DataLoader(train_dataset, batch_size=len(train_dataset))
-        data = next(iter(train_loader))
-        fast_cub_train = FastDataset(data[0], data[1])
-        torch.save(fast_cub_train, save_path)
+    train_dataset = torch.utils.data.Subset(dataset, np.where(train_test_split == 0)[0])
+    train_dataset.root = dataroot
 
-    save_path = f"{dataroot}/fast_cub200_val"
-    if os.path.exists(save_path):
-        fast_cub_val = torch.load(save_path)
-    else:
-        val_dataset = torch.utils.data.Subset(dataset, np.where(train_test_split == 1)[0])
-        val_dataset.root = dataroot
-        val_dataset = CacheClassLabel(
-                val_dataset,
-                target_transform=target_transform,
-            )
-        val_loader = DataLoader(val_dataset, batch_size=len(val_dataset))
-        data = next(iter(val_loader))
-        fast_cub_val = FastDataset(data[0], data[1])
-        torch.save(fast_cub_val, save_path)
+    val_dataset = torch.utils.data.Subset(dataset, np.where(train_test_split == 1)[0])
+    val_dataset.root = dataroot
 
     return (
-        fast_cub_train,
-        fast_cub_val,
+        train_dataset,
+        val_dataset,
         256,
         3,
         train_transform_clf,
@@ -610,25 +588,27 @@ def ImageNet(dataroot, skip_normalization=False, train_aug=False, classifier_aug
     std=[0.229, 0.224, 0.225]
 
     train_dataset = torchvision.datasets.ImageFolder(
-        root=os.path.join(dataroot, "train"),
+        root=os.path.join(dataroot, "imagenet", "train"),
         transform=transforms.Compose(
-                [
-                    transforms.Resize((256, 256)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean, std),
-                ]
-            ),
-            target_transform=target_transform,)
+            [
+                transforms.Resize((256, 256)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ]
+        ),
+        target_transform=target_transform,
+    )
     val_dataset = torchvision.datasets.ImageFolder(
-        root=os.path.join(dataroot, "val"),
+        root=os.path.join(dataroot, "imagenet", "val"),
         transform=transforms.Compose(
-                [
-                    transforms.Resize((256, 256)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean, std),
-                ]
-            ),
-            target_transform=target_transform,)
+            [
+                transforms.Resize((256, 256)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ]
+        ),
+        target_transform=target_transform,
+    )
 
     return (
         train_dataset,

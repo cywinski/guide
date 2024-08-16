@@ -8,7 +8,7 @@ from .logger import wandb_safe_log
 from .resnet import ResNet
 from .respace import SpacedDiffusion, space_timesteps
 from .script_args import model_and_diffusion_defaults
-from .unet import EncoderUNetModel, SuperResModel
+from .unet import EncoderUNetModel, SuperResModel, UNetModel
 
 # NUM_CLASSES = 1000
 
@@ -17,7 +17,6 @@ def create_model_and_diffusion(
     image_size,
     in_channels,
     learn_sigma,
-    sigma_small,
     num_channels,
     num_res_blocks,
     channel_mult,
@@ -38,22 +37,14 @@ def create_model_and_diffusion(
     resblock_updown,
     use_fp16,
     use_new_attention_order,
-    model_name,
-    model_switching_timestep,
-    embedding_kind,
     model_num_classes=None,
-    noise_marg_reg=False,
     train_noised_classifier=False,
-    classifier_augmentation=True,
 ):
     model = create_model(
         image_size,
         in_channels,
         num_channels,
         num_res_blocks,
-        model_name=model_name,
-        model_switching_timestep=model_switching_timestep,
-        embedding_kind=embedding_kind,
         channel_mult=channel_mult,
         learn_sigma=learn_sigma,
         use_checkpoint=use_checkpoint,
@@ -67,22 +58,17 @@ def create_model_and_diffusion(
         use_fp16=use_fp16,
         use_new_attention_order=use_new_attention_order,
         num_classes=model_num_classes,
-        classifier_augmentation=classifier_augmentation,
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
         learn_sigma=learn_sigma,
-        sigma_small=sigma_small,
         noise_schedule=noise_schedule,
         use_kl=use_kl,
         predict_xstart=predict_xstart,
         rescale_timesteps=rescale_timesteps,
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
-        noise_marg_reg=noise_marg_reg,
-        train_noised_classifier=train_noised_classifier,
     )
-
     return model, diffusion
 
 
@@ -91,9 +77,6 @@ def create_model(
     in_channels,
     num_channels,
     num_res_blocks,
-    model_name,
-    model_switching_timestep,
-    embedding_kind,
     channel_mult="",
     learn_sigma=False,
     use_checkpoint=False,
@@ -107,7 +90,6 @@ def create_model(
     use_fp16=False,
     use_new_attention_order=False,
     num_classes=None,
-    classifier_augmentation=False,
 ):
     if channel_mult == "":
         if image_size == 512:
@@ -133,14 +115,7 @@ def create_model(
     for res in attention_resolutions.split(","):
         attention_ds.append(image_size // int(res))
 
-    if model_name == "UNetModel":
-        print("Using single model")
-        from .unet import UNetModel as Model
-    elif model_name == "MLPModel":
-        from .mlp import MLPModel as Model
-    else:
-        raise NotImplementedError
-    return Model(
+    return UNetModel(
         image_size=image_size,
         in_channels=in_channels,
         model_channels=num_channels,
@@ -158,9 +133,6 @@ def create_model(
         use_scale_shift_norm=use_scale_shift_norm,
         resblock_updown=resblock_updown,
         use_new_attention_order=use_new_attention_order,
-        model_switching_timestep=model_switching_timestep,
-        embedding_kind=embedding_kind,
-        classifier_augmentation=classifier_augmentation,
     )
 
 
@@ -378,12 +350,9 @@ def create_gaussian_diffusion(
     noise_schedule="linear",
     use_kl=False,
     predict_xstart=False,
-    predict_xprevious=False,
     rescale_timesteps=False,
     rescale_learned_sigmas=False,
     timestep_respacing="",
-    noise_marg_reg=False,
-    train_noised_classifier=False,
 ):
     betas = gd.get_named_beta_schedule(noise_schedule, steps)
     if use_kl:
@@ -394,18 +363,12 @@ def create_gaussian_diffusion(
         loss_type = gd.LossType.MSE
     if not timestep_respacing:
         timestep_respacing = [steps]
-
-    if predict_xstart:
-        model_mean_type = gd.ModelMeanType.START_X
-    elif predict_xprevious:
-        model_mean_type = gd.ModelMeanType.PREVIOUS_X
-    else:
-        model_mean_type = gd.ModelMeanType.EPSILON
-
     return SpacedDiffusion(
         use_timesteps=space_timesteps(steps, timestep_respacing),
         betas=betas,
-        model_mean_type=model_mean_type,
+        model_mean_type=(
+            gd.ModelMeanType.EPSILON if not predict_xstart else gd.ModelMeanType.START_X
+        ),
         model_var_type=(
             (
                 gd.ModelVarType.FIXED_LARGE
@@ -417,8 +380,6 @@ def create_gaussian_diffusion(
         ),
         loss_type=loss_type,
         rescale_timesteps=rescale_timesteps,
-        noise_marg_reg=noise_marg_reg,
-        train_noised_classifier=train_noised_classifier,
     )
 
 

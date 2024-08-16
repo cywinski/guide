@@ -6,22 +6,23 @@ import time
 import blobfile as bf
 import numpy as np
 import torch as th
+th.set_float32_matmul_precision("high")
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
 from tqdm import tqdm
+from torchvision.utils import make_grid
 
 import wandb
 from dataloaders.utils import yielder
 from dataloaders.wrapper import AppendName
 
 from . import dist_util, logger
-from .fp16_util import MixedPrecisionTrainer
 from .logger import wandb_safe_log
 from .nn import update_ema
-from .resample import LossAwareSampler, TaskAwareSampler, UniformSampler
+from .resample import LossAwareSampler, UniformSampler
 
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
@@ -162,54 +163,32 @@ class TrainLoop:
         self.sync_cuda = th.cuda.is_available()
 
         self._load_and_sync_parameters()
-        self.mp_trainer = MixedPrecisionTrainer(
-            model=self.model,
-            use_fp16=self.use_fp16,
-            fp16_scale_growth=fp16_scale_growth,
-        )
-
-        self.opt = AdamW(
-            self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
-        )
-
-        self.scheduler = th.optim.lr_scheduler.ExponentialLR(
-            self.opt, gamma=scheduler_rate
-        )
-        self.scheduler_step = scheduler_step
         self.classifier_first_task_dir = classifier_first_task_dir
 
-        if self.disjoint_classifier is not None:
-            self.mp_trainer_classifier = MixedPrecisionTrainer(
-                model=self.disjoint_classifier,
-                use_fp16=self.use_fp16,
-                initial_lg_loss_scale=16.0,
-            )
+        self.disjoint_classifier_optimizer = th.optim.AdamW(
+            self.disjoint_classifier.parameters(),
+            lr=(
+                self.params.classifier_lr
+                if self.task_id != 0
+                else self.params.classifier_init_lr
+            ),
+            weight_decay=self.params.classifier_weight_decay,
+        )
+        self.num_batches_per_epoch = len(self.data) // (self.batch_size // 2)
 
-            self.disjoint_classifier_optimizer = th.optim.SGD(
-                self.mp_trainer_classifier.master_params,
-                lr=(
-                    self.params.classifier_lr
-                    if self.task_id != 0
-                    else self.params.classifier_init_lr
-                ),
-                weight_decay=self.params.classifier_weight_decay,
-                momentum=0.9,
-            )
-            self.num_batches_per_epoch = len(self.data) // (self.batch_size//2)
+        if th.__version__ >= "2.0":
+            gpu_ok = False
+            if th.cuda.is_available():
+                device_cap = th.cuda.get_device_capability()
+                if device_cap in ((7, 0), (8, 0), (9, 0)):
+                    gpu_ok = True
+            if gpu_ok:
+                self.prev_model = th.compile(self.prev_model)
+                logger.info("Diffusion model compiled")
+                self.disjoint_classifier = th.compile(self.disjoint_classifier)
+                logger.info("Classifier model compiled")
 
-        if self.resume_step:
-            self._load_optimizer_state()
-            # Model was resumed, either due to a restart or a checkpoint
-            # being specified at the command line.
-            self.ema_params = [
-                self._load_ema_parameters(rate) for rate in self.ema_rate
-            ]
-        else:
-            self.ema_params = [
-                copy.deepcopy(self.mp_trainer.master_params)
-                for _ in range(len(self.ema_rate))
-            ]
-
+        self.prev_model = self.prev_model.to(dist_util.dev())
         if th.cuda.is_available():
             self.use_ddp = True
             self.prev_ddp_model = DDP(
@@ -221,35 +200,23 @@ class TrainLoop:
                 find_unused_parameters=False,
             )
             self.prev_ddp_model.eval()
-            if self.disjoint_classifier is not None:
-                self.disjoint_classifier = DDP(
-                    self.disjoint_classifier,
-                    device_ids=[dist_util.dev()],
-                    output_device=dist_util.dev(),
-                    broadcast_buffers=False,
-                    bucket_cap_mb=128,
-                    find_unused_parameters=False,
-                )
-                self.prev_disjoint_classifier = DDP(
-                    self.prev_disjoint_classifier,
-                    device_ids=[dist_util.dev()],
-                    output_device=dist_util.dev(),
-                    broadcast_buffers=False,
-                    bucket_cap_mb=128,
-                    find_unused_parameters=False,
-                )
-                self.prev_disjoint_classifier.eval()
-            else:
-                # NOTE: We need current diffusion only if we are not training classifier
-                self.ddp_model = DDP(
-                    self.model,
-                    device_ids=[dist_util.dev()],
-                    output_device=dist_util.dev(),
-                    broadcast_buffers=False,
-                    bucket_cap_mb=128,
-                    find_unused_parameters=False,
-                )
-
+            self.disjoint_classifier = DDP(
+                self.disjoint_classifier,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=False,
+            )
+            self.prev_disjoint_classifier = DDP(
+                self.prev_disjoint_classifier,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=False,
+            )
+            self.prev_disjoint_classifier.eval()
         else:
             if dist.get_world_size() > 1:
                 logger.warn(
@@ -320,11 +287,9 @@ class TrainLoop:
             # Fix the forever loading of the model when training on multiple GPUs:
             # https://github.com/openai/guided-diffusion/issues/23#issuecomment-1055499214
             self.prev_model.load_state_dict(
-                dist_util.load_state_dict(
-                    prev_resume_checkpoint, map_location=dist_util.dev()
-                )
+                dist_util.load_state_dict(prev_resume_checkpoint, map_location="cpu")
             )
-            dist_util.sync_params(self.prev_model.parameters())
+            # dist_util.sync_params(self.prev_model.parameters())
             self.prev_model.eval()
         # NOTE: Only load the current model if we are not training classifier
         if curr_resume_checkpoint and self.disjoint_classifier is None:
@@ -391,14 +356,17 @@ class TrainLoop:
                         epoch = curr_epoch
 
                         # calculate accuracy each epoch
-                        logger.log("validation...")
-                        val_accuracy_imagenet_top1, val_accuracy_imagenet_top5 = calculate_accuracy(self.disjoint_classifier, self.val_loader_imagenet)
-                        val_accuracy_cub_top1, val_accuracy_cub_top5 = calculate_accuracy(self.disjoint_classifier, self.val_loader_cub, is_cub=True)
+                        logger.log(f"validation epoch {epoch} ...")
+                        val_accuracy_imagenet_top1 = calculate_accuracy(
+                            self.disjoint_classifier, self.val_loader_imagenet
+                        )
+                        val_accuracy_cub_top1 = calculate_accuracy(
+                            self.disjoint_classifier, self.val_loader_cub, is_cub=True
+                        )
                         if logger.get_rank_without_mpi_import() == 0:
                             wandb_safe_log({"test/accuracy_imagenet@1": val_accuracy_imagenet_top1,"test/accuracy_cub200@1": val_accuracy_cub_top1}, step=self.get_global_step())
                             logger.log(f"Validation accuracy@1 on ImageNet epoch {epoch}: {val_accuracy_imagenet_top1}")
                             logger.log(f"Validation accuracy@1 on CUB-200 epoch {epoch}: {val_accuracy_cub_top1}")
-
 
                     real_examples, real_cond = next(
                         self.data_yielder
@@ -449,15 +417,12 @@ class TrainLoop:
                         logger.get_rank_without_mpi_import() == 0
                         and (self.step - 1) % self.log_interval == 0
                     ):
-                        logger.log_generated_examples(
+                        samples_grid = make_grid(
                             generated_previous_examples,
-                            th.argmax(generated_previous_labels, 1),
-                            generated_previous_examples_confidences,
-                            self.task_id,
-                            n_examples_to_log=(
-                                (self.batch_size // (self.task_id + 1))
-                            )
-                            // (self.classes_per_task),
+                            normalize=True,
+                        )
+                        wandb.log(
+                            {f"generated_examples": wandb.Image(samples_grid)},
                             step=self.get_global_step(),
                         )
 
@@ -526,15 +491,11 @@ class TrainLoop:
                             del losses
 
                         if i == 0:
-                            self.mp_trainer_classifier.zero_grad()
-                        loss = loss.mean()
-                        self.mp_trainer_classifier.backward(
-                            loss * len(micro) / len(batch)
-                        )
+                            self.disjoint_classifier_optimizer.zero_grad()
+                        loss = loss.mean() * len(micro) / len(batch)
+                        loss.backward()
 
-                    self.mp_trainer_classifier.optimize(
-                        self.disjoint_classifier_optimizer
-                    )
+                    self.disjoint_classifier_optimizer.step()
                     pbar.update(1)
 
             if logger.get_rank_without_mpi_import() == 0:
@@ -544,13 +505,10 @@ class TrainLoop:
                 )
                 print(f"sampling time: {sampling_time}")
             self.disjoint_classifier.eval()
-            save_model(
-                self.mp_trainer_classifier,
-                self.disjoint_classifier_optimizer,
-                self.step,
-                self.task_id,
+            th.save(
+                self.disjoint_classifier.state_dict(),
+                os.path.join(logger.get_dir(), f"disjoint_clf_final.pt"),
             )
-
     def run_step(self, batch, cond, step):
         self.forward_backward(batch, cond, step)
         took_step = self.mp_trainer.optimize(self.opt)
@@ -1009,22 +967,27 @@ def prepare_diffusion(args, timestep_respacing):
         timestep_respacing=timestep_respacing,
     )
 
-def calculate_accuracy(model, validation_loader, device='cuda' if th.cuda.is_available() else 'cpu', is_cub=False):
+
+def calculate_accuracy(model, validation_loader, is_cub=False):
     model.eval()  # Set the model to evaluation mode
     correct_top1 = 0
-    correct_top5 = 0
     total = 0
 
     with th.no_grad():  # Disable gradient calculation
-        for inputs, labels in validation_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
+        for inputs, labels in tqdm(validation_loader, total=len(validation_loader)):
+            inputs, labels = inputs.to(dist_util.dev()), labels.to(dist_util.dev())
 
             outputs = model(inputs)
             if is_cub:
-                extended_labels = th.cat((th.zeros(labels.size(0), 1000, device=device), labels), dim=1)
+                extended_labels = th.cat(
+                    (th.zeros(labels.size(0), 1000, device=dist_util.dev()), labels),
+                    dim=1,
+                )
             else:
-                extended_labels = th.cat((labels, th.zeros(labels.size(0), 200, device=device)), dim=1)
-
+                extended_labels = th.cat(
+                    (labels, th.zeros(labels.size(0), 200, device=dist_util.dev())),
+                    dim=1,
+                )
 
             # Convert one-hot to class indices
             _, true_labels = th.max(extended_labels, 1)
@@ -1032,13 +995,7 @@ def calculate_accuracy(model, validation_loader, device='cuda' if th.cuda.is_ava
             # Top-1 accuracy
             _, predicted_top1 = th.max(outputs.data, 1)
             correct_top1 += (predicted_top1 == true_labels).sum().item()
-
-            # Top-5 accuracy
-            _, predicted_top5 = outputs.topk(5, 1, largest=True, sorted=True)
-            correct_top5 += th.eq(predicted_top5, true_labels.view(-1, 1).expand_as(predicted_top5)).sum().item()
-
             total += labels.size(0)
 
-    accuracy_top1 = 100 * correct_top1 / total
-    accuracy_top5 = 100 * correct_top5 / total
-    return accuracy_top1, accuracy_top5
+    accuracy_top1 = correct_top1 / total
+    return accuracy_top1
