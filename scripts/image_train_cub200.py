@@ -132,7 +132,6 @@ def run_training_with_args(args):
     # Replace the old fc layer with the new one
     classifier.fc = new_fc
     classifier.to(dist_util.dev())
-    dist_util.sync_params(classifier.parameters())
 
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
@@ -141,8 +140,6 @@ def run_training_with_args(args):
         batch_size=args.batch_size,
         shuffle=False,
         generator=random_generator,
-        pin_memory=True,
-        # num_workers=8,
     )
 
     val_loader_imagenet = th.utils.data.DataLoader(
@@ -150,8 +147,6 @@ def run_training_with_args(args):
         batch_size=args.batch_size,
         shuffle=False,
         generator=random_generator,
-        pin_memory=True,
-        # num_workers=8,
     )
 
     train_loader = th.utils.data.DataLoader(
@@ -160,7 +155,6 @@ def run_training_with_args(args):
         shuffle=True,
         drop_last=True,
         generator=random_generator,
-        pin_memory=True,
     )
     dataset_yielder = yielder(train_loader)
 
@@ -221,24 +215,6 @@ def run_training_with_args(args):
         val_loader_imagenet=val_loader_imagenet,
         val_loader_cub=val_loader_cub,
     )
-
-    logger.log("validation...")
-    validation_start_time = time.time()
-    val_accuracy_imagenet_top1 = calculate_accuracy(classifier, val_loader_imagenet)
-    val_accuracy_cub_top1 = calculate_accuracy(classifier, val_loader_cub, is_cub=True)
-    validation_time = time.time() - validation_start_time
-    if logger.get_rank_without_mpi_import() == 0:
-        wandb_safe_log(
-            {
-                "test/accuracy_imagenet@1": val_accuracy_imagenet_top1,
-                "test/accuracy_cub200@1": val_accuracy_cub_top1,
-            },
-            step=global_step,
-        )
-        logger.log(
-            f"Validation accuracy@1 on ImageNet init: {val_accuracy_imagenet_top1}"
-        )
-        logger.log(f"Validation accuracy@1 on CUB-200 init: {val_accuracy_cub_top1}")
 
     train_loop_start_time = time.time()
     train_loop.run_loop()

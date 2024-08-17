@@ -189,43 +189,43 @@ class TrainLoop:
                 logger.info("Classifier model compiled")
 
         self.prev_model = self.prev_model.to(dist_util.dev())
-        if th.cuda.is_available():
-            self.use_ddp = True
-            self.prev_ddp_model = DDP(
-                self.prev_model,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
-            )
-            self.prev_ddp_model.eval()
-            self.disjoint_classifier = DDP(
-                self.disjoint_classifier,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
-            )
-            self.prev_disjoint_classifier = DDP(
-                self.prev_disjoint_classifier,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
-            )
-            self.prev_disjoint_classifier.eval()
-        else:
-            if dist.get_world_size() > 1:
-                logger.warn(
-                    "Distributed training requires CUDA. "
-                    "Gradients will not be synchronized properly!"
-                )
-            self.use_ddp = False
-            self.ddp_model = self.model
-            self.prev_ddp_model = self.prev_model
+        # if th.cuda.is_available():
+        #     self.use_ddp = True
+        #     self.prev_ddp_model = DDP(
+        #         self.prev_model,
+        #         device_ids=[dist_util.dev()],
+        #         output_device=dist_util.dev(),
+        #         broadcast_buffers=False,
+        #         bucket_cap_mb=128,
+        #         find_unused_parameters=False,
+        #     )
+        #     self.prev_ddp_model.eval()
+        #     self.disjoint_classifier = DDP(
+        #         self.disjoint_classifier,
+        #         device_ids=[dist_util.dev()],
+        #         output_device=dist_util.dev(),
+        #         broadcast_buffers=False,
+        #         bucket_cap_mb=128,
+        #         find_unused_parameters=False,
+        #     )
+        #     self.prev_disjoint_classifier = DDP(
+        #         self.prev_disjoint_classifier,
+        #         device_ids=[dist_util.dev()],
+        #         output_device=dist_util.dev(),
+        #         broadcast_buffers=False,
+        #         bucket_cap_mb=128,
+        #         find_unused_parameters=False,
+        #     )
+        #     self.prev_disjoint_classifier.eval()
+        # else:
+        #     if dist.get_world_size() > 1:
+        #         logger.warn(
+        #             "Distributed training requires CUDA. "
+        #             "Gradients will not be synchronized properly!"
+        #         )
+        self.use_ddp = False
+        self.ddp_model = self.model
+        self.prev_ddp_model = self.prev_model
 
         self.global_steps_before = global_steps_before
         self.cl_method = cl_method
@@ -355,18 +355,19 @@ class TrainLoop:
                         )
                         epoch = curr_epoch
 
-                        # calculate accuracy each epoch
-                        logger.log(f"validation epoch {epoch} ...")
-                        val_accuracy_imagenet_top1 = calculate_accuracy(
-                            self.disjoint_classifier, self.val_loader_imagenet
+                        # save model each epoch
+                        logger.log(f"saving model epoch {epoch} ...")
+                        checkpoint = {
+                            "epoch": epoch,
+                            "model": self.disjoint_classifier,
+                            "optimizer": self.disjoint_classifier_optimizer,
+                        }
+                        th.save(
+                            checkpoint,
+                            os.path.join(
+                                logger.get_dir(), f"disjoint_clf_epoch{epoch}.pt"
+                            ),
                         )
-                        val_accuracy_cub_top1 = calculate_accuracy(
-                            self.disjoint_classifier, self.val_loader_cub, is_cub=True
-                        )
-                        if logger.get_rank_without_mpi_import() == 0:
-                            wandb_safe_log({"test/accuracy_imagenet@1": val_accuracy_imagenet_top1,"test/accuracy_cub200@1": val_accuracy_cub_top1}, step=self.get_global_step())
-                            logger.log(f"Validation accuracy@1 on ImageNet epoch {epoch}: {val_accuracy_imagenet_top1}")
-                            logger.log(f"Validation accuracy@1 on CUB-200 epoch {epoch}: {val_accuracy_cub_top1}")
 
                     real_examples, real_cond = next(
                         self.data_yielder
@@ -504,11 +505,15 @@ class TrainLoop:
                     step=self.get_global_step(),
                 )
                 print(f"sampling time: {sampling_time}")
-            self.disjoint_classifier.eval()
+            checkpoint = {
+                "epoch": epoch,
+                "model": self.disjoint_classifier,
+                "optimizer": self.disjoint_classifier_optimizer,
+            }
             th.save(
-                self.disjoint_classifier.state_dict(),
-                os.path.join(logger.get_dir(), f"disjoint_clf_final.pt"),
+                checkpoint, os.path.join(logger.get_dir(), f"disjoint_clf_final.pt")
             )
+
     def run_step(self, batch, cond, step):
         self.forward_backward(batch, cond, step)
         took_step = self.mp_trainer.optimize(self.opt)
@@ -527,14 +532,7 @@ class TrainLoop:
                 for k, v in cond.items()
             }
             last_batch = (i + self.microbatch) >= batch.shape[0]
-            if isinstance(self.schedule_sampler, TaskAwareSampler):
-                t, weights = self.schedule_sampler.sample(
-                    micro.shape[0], dist_util.dev(), micro_cond["y"], self.task_id
-                )
-            else:
-                t, weights = self.schedule_sampler.sample(
-                    micro.shape[0], dist_util.dev()
-                )
+            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
 
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
