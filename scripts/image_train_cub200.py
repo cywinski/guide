@@ -85,6 +85,8 @@ def run_training_with_args(args):
         skip_normalization=args.skip_normalization,
         classifier_augmentation=args.classifier_augmentation,
     )
+    logger.info(f"Len train CUB-200 dataset = {len(train_dataset_cub)}")
+    logger.info(f"Len val CUB-200 dataset = {len(val_dataset_cub)}")
 
     (
         train_dataset_imagenet,
@@ -100,6 +102,8 @@ def run_training_with_args(args):
         skip_normalization=args.skip_normalization,
         classifier_augmentation=args.classifier_augmentation,
     )
+    logger.info(f"Len train ImageNet dataset = {len(train_dataset_imagenet)}")
+    logger.info(f"Len val ImageNet dataset = {len(val_dataset_imagenet)}")
 
     args.image_size = image_size
     args.in_channels = image_channels
@@ -140,6 +144,7 @@ def run_training_with_args(args):
         batch_size=args.batch_size,
         shuffle=False,
         generator=random_generator,
+        num_workers=8,
     )
 
     val_loader_imagenet = th.utils.data.DataLoader(
@@ -147,6 +152,7 @@ def run_training_with_args(args):
         batch_size=args.batch_size,
         shuffle=False,
         generator=random_generator,
+        num_workers=8,
     )
 
     train_loader = th.utils.data.DataLoader(
@@ -216,6 +222,30 @@ def run_training_with_args(args):
         val_loader_cub=val_loader_cub,
     )
 
+    logger.log("validation...")
+    validation_start_time = time.time()
+    val_accuracy_imagenet_top1, val_accuracy_imagenet_top5 = calculate_accuracy(
+        classifier, val_loader_imagenet
+    )
+    val_accuracy_cub_top1, val_accuracy_cub_top5 = calculate_accuracy(
+        classifier, val_loader_cub, is_cub=True
+    )
+    validation_time = time.time() - validation_start_time
+    if logger.get_rank_without_mpi_import() == 0:
+        wandb_safe_log(
+            {
+                "test/accuracy_imagenet@1": val_accuracy_imagenet_top1,
+                "test/accuracy_cub200@1": val_accuracy_cub_top1,
+                "test/accuracy_imagenet@5": val_accuracy_imagenet_top5,
+                "test/accuracy_cub200@5": val_accuracy_cub_top5,
+            },
+            step=global_step,
+        )
+        logger.log(f"Validation accuracy@1 on ImageNet: {val_accuracy_imagenet_top1}")
+        logger.log(f"Validation accuracy@5 on ImageNet: {val_accuracy_imagenet_top5}")
+        logger.log(f"Validation accuracy@1 on CUB-200: {val_accuracy_cub_top1}")
+        logger.log(f"Validation accuracy@5 on CUB-200: {val_accuracy_cub_top5}")
+
     train_loop_start_time = time.time()
     train_loop.run_loop()
     global_step += num_steps
@@ -224,21 +254,31 @@ def run_training_with_args(args):
 
     logger.log("validation...")
     validation_start_time = time.time()
-    val_accuracy_imagenet_top1 = calculate_accuracy(classifier, val_loader_imagenet)
-    val_accuracy_cub_top1 = calculate_accuracy(classifier, val_loader_cub, is_cub=True)
+    val_accuracy_imagenet_top1, val_accuracy_imagenet_top5 = calculate_accuracy(
+        classifier, val_loader_imagenet
+    )
+    val_accuracy_cub_top1, val_accuracy_cub_top5 = calculate_accuracy(
+        classifier, val_loader_cub, is_cub=True
+    )
     validation_time = time.time() - validation_start_time
     if logger.get_rank_without_mpi_import() == 0:
         wandb_safe_log(
             {
                 "test/accuracy_imagenet@1": val_accuracy_imagenet_top1,
                 "test/accuracy_cub200@1": val_accuracy_cub_top1,
+                "test/accuracy_imagenet@5": val_accuracy_imagenet_top5,
+                "test/accuracy_cub200@5": val_accuracy_cub_top5,
             },
             step=global_step,
         )
         logger.log(
             f"Validation accuracy@1 on ImageNet final: {val_accuracy_imagenet_top1}"
         )
+        logger.log(
+            f"Validation accuracy@5 on ImageNet final: {val_accuracy_imagenet_top5}"
+        )
         logger.log(f"Validation accuracy@1 on CUB-200 final: {val_accuracy_cub_top1}")
+        logger.log(f"Validation accuracy@5 on CUB-200 final: {val_accuracy_cub_top5}")
 
 
 def seed_everything(seed):

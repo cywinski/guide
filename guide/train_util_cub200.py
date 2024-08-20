@@ -174,7 +174,7 @@ class TrainLoop:
             ),
             weight_decay=self.params.classifier_weight_decay,
         )
-        self.num_batches_per_epoch = len(self.data) // (self.batch_size // 2)
+        self.num_batches_per_epoch = len(self.data_loader)
 
         if th.__version__ >= "2.0":
             gpu_ok = False
@@ -341,7 +341,7 @@ class TrainLoop:
                 prev_generations_labels = None
                 while self.step < self.num_steps:
                     self.step += 1
-                    curr_epoch = self.step // self.num_batches_per_epoch
+                    curr_epoch = (self.step - 1) // self.num_batches_per_epoch
                     # Handle lr scheduling
                     if curr_epoch != epoch:
                         set_annealed_lr(
@@ -355,19 +355,59 @@ class TrainLoop:
                         )
                         epoch = curr_epoch
 
-                        # save model each epoch
-                        logger.log(f"saving model epoch {epoch} ...")
-                        checkpoint = {
-                            "epoch": epoch,
-                            "model": self.disjoint_classifier,
-                            "optimizer": self.disjoint_classifier_optimizer,
-                        }
-                        th.save(
-                            checkpoint,
-                            os.path.join(
-                                logger.get_dir(), f"disjoint_clf_epoch{epoch}.pt"
-                            ),
+                        logger.log(f"validation epoch {epoch}...")
+                        validation_start_time = time.time()
+                        val_accuracy_imagenet_top1, val_accuracy_imagenet_top5 = (
+                            calculate_accuracy(
+                                self.disjoint_classifier,
+                                self.val_loader_imagenet,
+                                is_cub=False,
+                            )
                         )
+                        val_accuracy_cub_top1, val_accuracy_cub_top5 = (
+                            calculate_accuracy(
+                                self.disjoint_classifier,
+                                self.val_loader_cub,
+                                is_cub=True,
+                            )
+                        )
+                        validation_time = time.time() - validation_start_time
+                        if logger.get_rank_without_mpi_import() == 0:
+                            wandb_safe_log(
+                                {
+                                    "test/accuracy_imagenet@1": val_accuracy_imagenet_top1,
+                                    "test/accuracy_cub200@1": val_accuracy_cub_top1,
+                                    "test/accuracy_imagenet@5": val_accuracy_imagenet_top5,
+                                    "test/accuracy_cub200@5": val_accuracy_cub_top5,
+                                },
+                                step=self.get_global_step(),
+                            )
+                            logger.log(
+                                f"Validation accuracy@1 on ImageNet: {val_accuracy_imagenet_top1}"
+                            )
+                            logger.log(
+                                f"Validation accuracy@5 on ImageNet: {val_accuracy_imagenet_top5}"
+                            )
+                            logger.log(
+                                f"Validation accuracy@1 on CUB-200: {val_accuracy_cub_top1}"
+                            )
+                            logger.log(
+                                f"Validation accuracy@5 on CUB-200: {val_accuracy_cub_top5}"
+                            )
+
+                            # save model each epoch
+                            logger.log(f"saving model epoch {epoch} ...")
+                            checkpoint = {
+                                "epoch": epoch,
+                                "model": self.disjoint_classifier,
+                                "optimizer": self.disjoint_classifier_optimizer,
+                            }
+                            th.save(
+                                checkpoint,
+                                os.path.join(
+                                    logger.get_dir(), f"disjoint_clf_epoch{epoch}.pt"
+                                ),
+                            )
 
                     real_examples, real_cond = next(
                         self.data_yielder
@@ -446,15 +486,12 @@ class TrainLoop:
                         micro = batch[i : i + self.microbatch].to(dist_util.dev())
                         micro_cond = y[i : i + self.microbatch].to(dist_util.dev())
 
-                        replays_indices = th.where(
-                            th.argmax(micro_cond, 1)
-                            < (self.task_id) * self.classes_per_task
-                        )[0]
+                        replays_indices = th.where(th.argmax(micro_cond, 1) < 1000)[0]
 
                         out_classifier = self.disjoint_classifier(micro)
                         loss = F.cross_entropy(
-                            out_classifier[:, : self.max_class + 1],
-                            micro_cond[:, : self.max_class + 1],
+                            out_classifier,
+                            micro_cond,
                             reduction="none",
                         )
 
@@ -969,6 +1006,7 @@ def prepare_diffusion(args, timestep_respacing):
 def calculate_accuracy(model, validation_loader, is_cub=False):
     model.eval()  # Set the model to evaluation mode
     correct_top1 = 0
+    correct_top5 = 0
     total = 0
 
     with th.no_grad():  # Disable gradient calculation
@@ -993,7 +1031,17 @@ def calculate_accuracy(model, validation_loader, is_cub=False):
             # Top-1 accuracy
             _, predicted_top1 = th.max(outputs.data, 1)
             correct_top1 += (predicted_top1 == true_labels).sum().item()
+
+            # Top-5 accuracy
+            _, predicted_top5 = outputs.topk(5, 1, largest=True, sorted=True)
+            correct_top5 += (
+                th.eq(predicted_top5, true_labels.view(-1, 1).expand_as(predicted_top5))
+                .sum()
+                .item()
+            )
+
             total += labels.size(0)
 
     accuracy_top1 = correct_top1 / total
-    return accuracy_top1
+    accuracy_top5 = correct_top5 / total
+    return accuracy_top1, accuracy_top5

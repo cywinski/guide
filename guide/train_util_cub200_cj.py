@@ -6,22 +6,25 @@ import time
 import blobfile as bf
 import numpy as np
 import torch as th
+
+th.set_float32_matmul_precision("high")
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
 from tqdm import tqdm
+from torchvision.utils import make_grid
 
 import wandb
 from dataloaders.utils import yielder
 from dataloaders.wrapper import AppendName
 
 from . import dist_util, logger
-from .fp16_util import MixedPrecisionTrainer
 from .logger import wandb_safe_log
 from .nn import update_ema
-from .resample import LossAwareSampler, TaskAwareSampler, UniformSampler
+from .resample import LossAwareSampler, UniformSampler
+from guide.train_util_cub200 import calculate_accuracy
 
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
@@ -112,7 +115,6 @@ class TrainLoop:
         self.resume_checkpoint = resume_checkpoint
         self.use_fp16 = use_fp16
         self.fp16_scale_growth = fp16_scale_growth
-        self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
         self.num_steps = num_steps
@@ -164,55 +166,57 @@ class TrainLoop:
         self.scheduler_step = scheduler_step
         self.classifier_first_task_dir = classifier_first_task_dir
 
-        if self.disjoint_classifier is not None:
-            self.mp_trainer_classifier = MixedPrecisionTrainer(
-                model=self.disjoint_classifier,
-                use_fp16=self.use_fp16,
-                initial_lg_loss_scale=16.0,
-            )
+        self.disjoint_classifier_optimizer = th.optim.AdamW(
+            self.disjoint_classifier.parameters(),
+            lr=(
+                self.params.classifier_lr
+                if self.task_id != 0
+                else self.params.classifier_init_lr
+            ),
+            weight_decay=self.params.classifier_weight_decay,
+        )
+        self.num_batches_per_epoch = len(data_loader)
 
-            self.disjoint_classifier_optimizer = th.optim.SGD(
-                self.mp_trainer_classifier.master_params,
-                lr=(
-                    self.params.classifier_lr
-                    if self.task_id != 0
-                    else self.params.classifier_init_lr
-                ),
-                weight_decay=self.params.classifier_weight_decay,
-                momentum=0.9,
-            )
-            self.num_batches_per_epoch = len(self.data) // (self.batch_size//2)
+        if th.__version__ >= "2.0":
+            gpu_ok = False
+            if th.cuda.is_available():
+                device_cap = th.cuda.get_device_capability()
+                if device_cap in ((7, 0), (8, 0), (9, 0)):
+                    gpu_ok = True
+            if gpu_ok:
+                self.disjoint_classifier = th.compile(self.disjoint_classifier)
+                logger.info("Classifier model compiled")
 
-        if th.cuda.is_available():
-            self.use_ddp = True
-            if self.disjoint_classifier is not None:
-                self.disjoint_classifier = DDP(
-                    self.disjoint_classifier,
-                    device_ids=[dist_util.dev()],
-                    output_device=dist_util.dev(),
-                    broadcast_buffers=False,
-                    bucket_cap_mb=128,
-                    find_unused_parameters=False,
-                )
-                self.prev_disjoint_classifier = DDP(
-                    self.prev_disjoint_classifier,
-                    device_ids=[dist_util.dev()],
-                    output_device=dist_util.dev(),
-                    broadcast_buffers=False,
-                    bucket_cap_mb=128,
-                    find_unused_parameters=False,
-                )
-                self.prev_disjoint_classifier.eval()
+        # if th.cuda.is_available():
+        #     self.use_ddp = True
+        #     if self.disjoint_classifier is not None:
+        #         self.disjoint_classifier = DDP(
+        #             self.disjoint_classifier,
+        #             device_ids=[dist_util.dev()],
+        #             output_device=dist_util.dev(),
+        #             broadcast_buffers=False,
+        #             bucket_cap_mb=128,
+        #             find_unused_parameters=False,
+        #         )
+        #         self.prev_disjoint_classifier = DDP(
+        #             self.prev_disjoint_classifier,
+        #             device_ids=[dist_util.dev()],
+        #             output_device=dist_util.dev(),
+        #             broadcast_buffers=False,
+        #             bucket_cap_mb=128,
+        #             find_unused_parameters=False,
+        #         )
+        #         self.prev_disjoint_classifier.eval()
 
-        else:
-            if dist.get_world_size() > 1:
-                logger.warn(
-                    "Distributed training requires CUDA. "
-                    "Gradients will not be synchronized properly!"
-                )
-            self.use_ddp = False
-            self.ddp_model = self.model
-            self.prev_ddp_model = self.prev_model
+        # else:
+        #     if dist.get_world_size() > 1:
+        #         logger.warn(
+        #             "Distributed training requires CUDA. "
+        #             "Gradients will not be synchronized properly!"
+        #         )
+        self.use_ddp = False
+        self.ddp_model = self.model
+        self.prev_ddp_model = self.prev_model
 
         self.global_steps_before = global_steps_before
         self.cl_method = cl_method
@@ -331,7 +335,7 @@ class TrainLoop:
                 prev_generations_labels = None
                 while self.step < self.num_steps:
                     self.step += 1
-                    curr_epoch = self.step // self.num_batches_per_epoch
+                    curr_epoch = (self.step - 1) // self.num_batches_per_epoch
                     # Handle lr scheduling
                     if curr_epoch != epoch:
                         set_annealed_lr(
@@ -345,15 +349,59 @@ class TrainLoop:
                         )
                         epoch = curr_epoch
 
-                        # calculate accuracy each epoch
-                        logger.log("validation...")
-                        val_accuracy_imagenet_top1, val_accuracy_imagenet_top5 = calculate_accuracy(self.disjoint_classifier, self.val_loader_imagenet)
-                        val_accuracy_cub_top1, val_accuracy_cub_top5 = calculate_accuracy(self.disjoint_classifier, self.val_loader_cub, is_cub=True)
+                        logger.log(f"validation epoch {epoch}...")
+                        validation_start_time = time.time()
+                        val_accuracy_imagenet_top1, val_accuracy_imagenet_top5 = (
+                            calculate_accuracy(
+                                self.disjoint_classifier,
+                                self.val_loader_imagenet,
+                                is_cub=False,
+                            )
+                        )
+                        val_accuracy_cub_top1, val_accuracy_cub_top5 = (
+                            calculate_accuracy(
+                                self.disjoint_classifier,
+                                self.val_loader_cub,
+                                is_cub=True,
+                            )
+                        )
+                        validation_time = time.time() - validation_start_time
                         if logger.get_rank_without_mpi_import() == 0:
-                            wandb_safe_log({"test/accuracy_imagenet@1": val_accuracy_imagenet_top1,"test/accuracy_cub200@1": val_accuracy_cub_top1}, step=self.get_global_step())
-                            logger.log(f"Validation accuracy@1 on ImageNet epoch {epoch}: {val_accuracy_imagenet_top1}")
-                            logger.log(f"Validation accuracy@1 on CUB-200 epoch {epoch}: {val_accuracy_cub_top1}")
+                            wandb_safe_log(
+                                {
+                                    "test/accuracy_imagenet@1": val_accuracy_imagenet_top1,
+                                    "test/accuracy_cub200@1": val_accuracy_cub_top1,
+                                    "test/accuracy_imagenet@5": val_accuracy_imagenet_top5,
+                                    "test/accuracy_cub200@5": val_accuracy_cub_top5,
+                                },
+                                step=self.get_global_step(),
+                            )
+                            logger.log(
+                                f"Validation accuracy@1 on ImageNet: {val_accuracy_imagenet_top1}"
+                            )
+                            logger.log(
+                                f"Validation accuracy@5 on ImageNet: {val_accuracy_imagenet_top5}"
+                            )
+                            logger.log(
+                                f"Validation accuracy@1 on CUB-200: {val_accuracy_cub_top1}"
+                            )
+                            logger.log(
+                                f"Validation accuracy@5 on CUB-200: {val_accuracy_cub_top5}"
+                            )
 
+                            # save model each epoch
+                            logger.log(f"saving model epoch {epoch} ...")
+                            checkpoint = {
+                                "epoch": epoch,
+                                "model": self.disjoint_classifier,
+                                "optimizer": self.disjoint_classifier_optimizer,
+                            }
+                            th.save(
+                                checkpoint,
+                                os.path.join(
+                                    logger.get_dir(), f"disjoint_clf_epoch{epoch}.pt"
+                                ),
+                            )
 
                     real_examples, real_cond = next(
                         self.data_yielder
@@ -362,7 +410,11 @@ class TrainLoop:
                         prev_generations is None
                         or (self.step - 1) % self.guid_generation_interval == 0
                     ):
-                        prev_generations, prev_generations_labels = next(self.train_yielder_imagenet) # classes [0, 1000]
+                        generated_previous_examples, generated_previous_labels = next(
+                            self.train_yielder_imagenet
+                        )  # classes [0, 1000]
+                        prev_generations = generated_previous_examples.cpu()
+                        prev_generations_labels = generated_previous_labels.cpu()
                     else:
                         generated_previous_examples = prev_generations
                         generated_previous_labels = prev_generations_labels
@@ -392,27 +444,17 @@ class TrainLoop:
                         batch = self.train_transform_classifier(batch)
 
                     y = cond["y"]
-                    t = None
-
-                    if self.train_noised_classifier:
-                        t, _ = self.schedule_sampler.sample(
-                            batch.shape[0], dist_util.dev()
-                        )
-                        batch = self.diffusion.q_sample(batch, t)
 
                     for i in range(0, batch.shape[0], self.microbatch):
                         micro = batch[i : i + self.microbatch].to(dist_util.dev())
                         micro_cond = y[i : i + self.microbatch].to(dist_util.dev())
 
-                        replays_indices = th.where(
-                            th.argmax(micro_cond, 1)
-                            < (self.task_id) * self.classes_per_task
-                        )[0]
+                        replays_indices = th.where(th.argmax(micro_cond, 1) < 1000)[0]
 
                         out_classifier = self.disjoint_classifier(micro)
                         loss = F.cross_entropy(
-                            out_classifier[:, : self.max_class + 1],
-                            micro_cond[:, : self.max_class + 1],
+                            out_classifier,
+                            micro_cond,
                             reduction="none",
                         )
 
@@ -450,15 +492,12 @@ class TrainLoop:
                             del losses
 
                         if i == 0:
-                            self.mp_trainer_classifier.zero_grad()
-                        loss = loss.mean()
-                        self.mp_trainer_classifier.backward(
-                            loss * len(micro) / len(batch)
-                        )
+                            self.disjoint_classifier_optimizer.zero_grad()
+                        loss = loss.mean() * len(micro) / len(batch)
+                        print(len(micro) / len(batch))
+                        loss.backward()
 
-                    self.mp_trainer_classifier.optimize(
-                        self.disjoint_classifier_optimizer
-                    )
+                    self.disjoint_classifier_optimizer.step()
                     pbar.update(1)
 
             if logger.get_rank_without_mpi_import() == 0:
@@ -467,12 +506,13 @@ class TrainLoop:
                     step=self.get_global_step(),
                 )
                 print(f"sampling time: {sampling_time}")
-            self.disjoint_classifier.eval()
-            save_model(
-                self.mp_trainer_classifier,
-                self.disjoint_classifier_optimizer,
-                self.step,
-                self.task_id,
+            checkpoint = {
+                "epoch": epoch,
+                "model": self.disjoint_classifier,
+                "optimizer": self.disjoint_classifier_optimizer,
+            }
+            th.save(
+                checkpoint, os.path.join(logger.get_dir(), f"disjoint_clf_final.pt")
             )
 
     def run_step(self, batch, cond, step):
@@ -493,14 +533,7 @@ class TrainLoop:
                 for k, v in cond.items()
             }
             last_batch = (i + self.microbatch) >= batch.shape[0]
-            if isinstance(self.schedule_sampler, TaskAwareSampler):
-                t, weights = self.schedule_sampler.sample(
-                    micro.shape[0], dist_util.dev(), micro_cond["y"], self.task_id
-                )
-            else:
-                t, weights = self.schedule_sampler.sample(
-                    micro.shape[0], dist_util.dev()
-                )
+            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
 
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
@@ -932,37 +965,3 @@ def prepare_diffusion(args, timestep_respacing):
         rescale_learned_sigmas=args.rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
     )
-
-def calculate_accuracy(model, validation_loader, device='cuda' if th.cuda.is_available() else 'cpu', is_cub=False):
-    model.eval()  # Set the model to evaluation mode
-    correct_top1 = 0
-    correct_top5 = 0
-    total = 0
-
-    with th.no_grad():  # Disable gradient calculation
-        for inputs, labels in validation_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            outputs = model(inputs)
-            if is_cub:
-                extended_labels = th.cat((th.zeros(labels.size(0), 1000, device=device), labels), dim=1)
-            else:
-                extended_labels = th.cat((labels, th.zeros(labels.size(0), 200, device=device)), dim=1)
-
-
-            # Convert one-hot to class indices
-            _, true_labels = th.max(extended_labels, 1)
-
-            # Top-1 accuracy
-            _, predicted_top1 = th.max(outputs.data, 1)
-            correct_top1 += (predicted_top1 == true_labels).sum().item()
-
-            # Top-5 accuracy
-            _, predicted_top5 = outputs.topk(5, 1, largest=True, sorted=True)
-            correct_top5 += th.eq(predicted_top5, true_labels.view(-1, 1).expand_as(predicted_top5)).sum().item()
-
-            total += labels.size(0)
-
-    accuracy_top1 = 100 * correct_top1 / total
-    accuracy_top5 = 100 * correct_top5 / total
-    return accuracy_top1, accuracy_top5

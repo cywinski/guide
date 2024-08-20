@@ -548,17 +548,18 @@ def CUB200(dataroot, skip_normalization=False, train_aug=False, classifier_augme
     if classifier_augmentation:
         train_transform_clf = K.augmentation.ImageSequential(
             K.augmentation.Denormalize(mean, std),
-            K.augmentation.RandomRotation(30),
-            K.augmentation.RandomHorizontalFlip(),
-            K.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1),
+            K.augmentation.auto.AutoAugment(policy="imagenet"),
             K.augmentation.Normalize(mean, std),
         )
+
     target_transform = transforms.Lambda(lambda y: torch.eye(200)[y])
     dataset = torchvision.datasets.ImageFolder(
         root=os.path.join(dataroot, "CUB_200_2011", "images"),
         transform=transforms.Compose(
             [
-                transforms.Resize((256, 256)),
+                transforms.Resize(
+                    (256, 256), interpolation=transforms.InterpolationMode.BILINEAR
+                ),
                 transforms.ToTensor(),
                 transforms.Normalize(mean, std),
             ]
@@ -566,15 +567,42 @@ def CUB200(dataroot, skip_normalization=False, train_aug=False, classifier_augme
         target_transform=target_transform,
     )
 
-    train_dataset = torch.utils.data.Subset(dataset, np.where(train_test_split == 0)[0])
+    train_dataset = torch.utils.data.Subset(dataset, np.where(train_test_split == 1)[0])
     train_dataset.root = dataroot
+    train_dataset = CacheClassLabel(
+        train_dataset,
+        target_transform=target_transform,
+    )
 
-    val_dataset = torch.utils.data.Subset(dataset, np.where(train_test_split == 1)[0])
+    val_dataset = torch.utils.data.Subset(dataset, np.where(train_test_split == 0)[0])
     val_dataset.root = dataroot
+    val_dataset = CacheClassLabel(
+        val_dataset,
+        target_transform=target_transform,
+    )
+
+    print("Loading data")
+    save_path = f"{dataroot}/fast_cub_train"
+    if os.path.exists(save_path):
+        fast_cub_train = torch.load(save_path)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=len(train_dataset))
+        data = next(iter(train_loader))
+        fast_cub_train = FastDataset(data[0], data[1])
+        torch.save(fast_cub_train, save_path)
+
+    save_path = f"{dataroot}/fast_cub_val"
+    if os.path.exists(save_path):
+        fast_cub_val = torch.load(save_path)
+    else:
+        val_loader = DataLoader(val_dataset, batch_size=len(val_dataset))
+        data = next(iter(val_loader))
+        fast_cub_val = FastDataset(data[0], data[1])
+        torch.save(fast_cub_val, save_path)
 
     return (
-        train_dataset,
-        val_dataset,
+        fast_cub_train,
+        fast_cub_val,
         256,
         3,
         train_transform_clf,
@@ -587,11 +615,23 @@ def ImageNet(dataroot, skip_normalization=False, train_aug=False, classifier_aug
     mean = [0.485, 0.456, 0.406]
     std=[0.229, 0.224, 0.225]
 
+    train_transform_clf = None
+
+    # augmentation for classifier training
+    if classifier_augmentation:
+        train_transform_clf = K.augmentation.ImageSequential(
+            K.augmentation.Denormalize(mean, std),
+            K.augmentation.auto.AutoAugment(policy="imagenet"),
+            K.augmentation.Normalize(mean, std),
+        )
+
     train_dataset = torchvision.datasets.ImageFolder(
         root=os.path.join(dataroot, "imagenet", "train"),
         transform=transforms.Compose(
             [
-                transforms.Resize((256, 256)),
+                transforms.Resize(
+                    (256, 256), interpolation=transforms.InterpolationMode.BILINEAR
+                ),
                 transforms.ToTensor(),
                 transforms.Normalize(mean, std),
             ]
@@ -602,20 +642,36 @@ def ImageNet(dataroot, skip_normalization=False, train_aug=False, classifier_aug
         root=os.path.join(dataroot, "imagenet", "val"),
         transform=transforms.Compose(
             [
-                transforms.Resize((256, 256)),
+                transforms.Resize(
+                    (256, 256), interpolation=transforms.InterpolationMode.BILINEAR
+                ),
                 transforms.ToTensor(),
                 transforms.Normalize(mean, std),
             ]
         ),
         target_transform=target_transform,
     )
+    # val_dataset.root = dataroot
+    # val_dataset = CacheClassLabel(
+    #     val_dataset,
+    #     target_transform=target_transform,
+    # )
+
+    # save_path = f"{dataroot}/fast_imagenet_val"
+    # if os.path.exists(save_path):
+    #     fast_im_val = torch.load(save_path)
+    # else:
+    #     val_loader = DataLoader(val_dataset, batch_size=len(val_dataset))
+    #     data = next(iter(val_loader))
+    #     fast_im_val = FastDataset(data[0], data[1])
+    #     torch.save(fast_im_val, save_path)
 
     return (
         train_dataset,
         val_dataset,
         256,
         3,
-        None,
+        train_transform_clf,
         None,
         1000,
     )
