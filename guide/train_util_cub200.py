@@ -426,25 +426,24 @@ class TrainLoop:
                         ) = self.generate_examples(
                             self.task_id - 1,
                             (self.batch_size // 2),
-                            batch_size=-1,
+                            batch_size=self.microbatch,
                             equal_n_examples_per_class=True,
                             use_old_grad=self.use_old_grad,
                             use_new_grad=self.use_new_grad,
                             only_one_task=True,
                             real_examples=real_examples,  # needed for speedup generation
                         )
+                        print(generated_previous_examples.device)
                         sampling_time += time.time() - sampling_start
-                        prev_generations = generated_previous_examples.cpu()
-                        prev_generations_labels = (
-                            generated_previous_labels.cpu()
-                        )
+                        prev_generations = generated_previous_examples
+                        prev_generations_labels = generated_previous_labels
                     else:
                         generated_previous_examples = prev_generations
                         generated_previous_labels = prev_generations_labels
                     batch = th.cat([generated_previous_examples, real_examples])
                     extended_real_cond = th.cat(
                         [
-                            th.zeros(real_cond.size(0), 1000, device=real_cond.device),
+                            th.zeros(real_cond.size(0), 1000),
                             real_cond
                         ], dim=1
                     )
@@ -459,7 +458,7 @@ class TrainLoop:
                         and (self.step - 1) % self.log_interval == 0
                     ):
                         samples_grid = make_grid(
-                            generated_previous_examples,
+                            generated_previous_examples[:self.microbatch],
                             normalize=True,
                         )
                         wandb.log(
@@ -714,7 +713,7 @@ class TrainLoop:
                         norm_val = th.linalg.norm(grad_old.flatten(1), ord=th.inf)
                         grad_old = grad_old / norm_val
                     if not use_new_grad:
-                        return grad_old * classfier_scale_vec_old.view(-1, 1, 1, 1)
+                        return grad_old * self.classifier_scale_max_old
                 if use_new_grad:
                     logits_new = new_classifier_fn(x_in)
                     if self.trim_logits:
@@ -728,14 +727,14 @@ class TrainLoop:
                             ],
                             dim=-1,
                         )
-                        random_new_task_classes = (
+                        most_probable_new_task_classes = (
                             th.argmax(probs, dim=-1)
                             + max_class
                             + 1
                             - self.classes_per_task
                         )
                         loss_new = -F.cross_entropy(
-                            logits_new, random_new_task_classes, reduction="none"
+                            logits_new, most_probable_new_task_classes, reduction="none"
                         )
                     else:
                         loss_new = F.cross_entropy(logits_new, y, reduction="none")
@@ -744,11 +743,9 @@ class TrainLoop:
                         norm_val = th.linalg.norm(grad_new.flatten(1), ord=th.inf)
                         grad_new = grad_new / norm_val
                     if use_old_grad:
-                        return grad_old * classfier_scale_vec_old.view(
-                            -1, 1, 1, 1
-                        ) + grad_new * classfier_scale_vec_new.view(-1, 1, 1, 1)
+                        return grad_old * self.classifier_scale_max_old + grad_new * self.classifier_scale_max_new
                     else:
-                        return grad_new * classfier_scale_vec_new.view(-1, 1, 1, 1)
+                        return grad_new * self.classifier_scale_max_new
 
         with tqdm(total=total_num_examples, leave=False) as progress_bar:
             while len(all_images) * batch_size < total_num_examples:
@@ -760,31 +757,6 @@ class TrainLoop:
                 )
 
                 model_kwargs["y"] = classes
-
-                if self.disjoint_classifier is not None and use_old_grad:
-                    classfier_scale_vec_old = (
-                        th.from_numpy(
-                            np.random.uniform(
-                                low=self.classifier_scale_min_old,
-                                high=self.classifier_scale_max_old,
-                                size=(len(classes),),
-                            )
-                        )
-                        .float()
-                        .to(dist_util.dev())
-                    )
-                if self.disjoint_classifier is not None and use_new_grad:
-                    classfier_scale_vec_new = (
-                        th.from_numpy(
-                            np.random.uniform(
-                                low=self.classifier_scale_min_new,
-                                high=self.classifier_scale_max_new,
-                                size=(len(classes),),
-                            )
-                        )
-                        .float()
-                        .to(dist_util.dev())
-                    )
                 sample_fn = (
                     diffusion.ddim_sample_loop
                     if self.use_ddim
