@@ -176,7 +176,7 @@ class TrainLoop:
         )
         self.num_batches_per_epoch = len(self.data_loader)
 
-        if th.__version__ >= "2.0":
+        if th.__version__ >= "2.0" and dist.get_world_size() == 1:
             gpu_ok = False
             if th.cuda.is_available():
                 device_cap = th.cuda.get_device_capability()
@@ -189,43 +189,43 @@ class TrainLoop:
                 logger.info("Classifier model compiled")
 
         self.prev_model = self.prev_model.to(dist_util.dev())
-        # if th.cuda.is_available():
-        #     self.use_ddp = True
-        #     self.prev_ddp_model = DDP(
-        #         self.prev_model,
-        #         device_ids=[dist_util.dev()],
-        #         output_device=dist_util.dev(),
-        #         broadcast_buffers=False,
-        #         bucket_cap_mb=128,
-        #         find_unused_parameters=False,
-        #     )
-        #     self.prev_ddp_model.eval()
-        #     self.disjoint_classifier = DDP(
-        #         self.disjoint_classifier,
-        #         device_ids=[dist_util.dev()],
-        #         output_device=dist_util.dev(),
-        #         broadcast_buffers=False,
-        #         bucket_cap_mb=128,
-        #         find_unused_parameters=False,
-        #     )
-        #     self.prev_disjoint_classifier = DDP(
-        #         self.prev_disjoint_classifier,
-        #         device_ids=[dist_util.dev()],
-        #         output_device=dist_util.dev(),
-        #         broadcast_buffers=False,
-        #         bucket_cap_mb=128,
-        #         find_unused_parameters=False,
-        #     )
-        #     self.prev_disjoint_classifier.eval()
-        # else:
-        #     if dist.get_world_size() > 1:
-        #         logger.warn(
-        #             "Distributed training requires CUDA. "
-        #             "Gradients will not be synchronized properly!"
-        #         )
-        self.use_ddp = False
-        self.ddp_model = self.model
-        self.prev_ddp_model = self.prev_model
+        if th.cuda.is_available() and dist.get_world_size() > 1:
+            self.use_ddp = True
+            self.prev_ddp_model = DDP(
+                self.prev_model,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=False,
+            )
+            self.prev_ddp_model.eval()
+            self.disjoint_classifier = DDP(
+                self.disjoint_classifier,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=False,
+            )
+            self.prev_disjoint_classifier = DDP(
+                self.prev_disjoint_classifier,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=False,
+            )
+            self.prev_disjoint_classifier.eval()
+        else:
+            if dist.get_world_size() > 1:
+                logger.warn(
+                    "Distributed training requires CUDA. "
+                    "Gradients will not be synchronized properly!"
+                )
+            self.use_ddp = False
+            self.ddp_model = self.model
+            self.prev_ddp_model = self.prev_model
 
         self.global_steps_before = global_steps_before
         self.cl_method = cl_method
@@ -433,7 +433,6 @@ class TrainLoop:
                             only_one_task=True,
                             real_examples=real_examples,  # needed for speedup generation
                         )
-                        print(generated_previous_examples.device)
                         sampling_time += time.time() - sampling_start
                         prev_generations = generated_previous_examples
                         prev_generations_labels = generated_previous_labels
