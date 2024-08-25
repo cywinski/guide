@@ -174,7 +174,7 @@ class TrainLoop:
             ),
             weight_decay=self.params.classifier_weight_decay,
         )
-        self.num_batches_per_epoch = len(self.data_loader)
+        self.num_batches_per_epoch = len(self.data) // self.global_batch
 
         if th.__version__ >= "2.0" and dist.get_world_size() == 1:
             gpu_ok = False
