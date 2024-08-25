@@ -175,9 +175,9 @@ class TrainLoop:
             ),
             weight_decay=self.params.classifier_weight_decay,
         )
-        self.num_batches_per_epoch = len(data_loader)
+        self.num_batches_per_epoch = len(self.data) // (self.global_batch // 2)
 
-        if th.__version__ >= "2.0":
+        if th.__version__ >= "2.0" and dist.get_world_size() == 1:
             gpu_ok = False
             if th.cuda.is_available():
                 device_cap = th.cuda.get_device_capability()
@@ -187,36 +187,27 @@ class TrainLoop:
                 self.disjoint_classifier = th.compile(self.disjoint_classifier)
                 logger.info("Classifier model compiled")
 
-        # if th.cuda.is_available():
-        #     self.use_ddp = True
-        #     if self.disjoint_classifier is not None:
-        #         self.disjoint_classifier = DDP(
-        #             self.disjoint_classifier,
-        #             device_ids=[dist_util.dev()],
-        #             output_device=dist_util.dev(),
-        #             broadcast_buffers=False,
-        #             bucket_cap_mb=128,
-        #             find_unused_parameters=False,
-        #         )
-        #         self.prev_disjoint_classifier = DDP(
-        #             self.prev_disjoint_classifier,
-        #             device_ids=[dist_util.dev()],
-        #             output_device=dist_util.dev(),
-        #             broadcast_buffers=False,
-        #             bucket_cap_mb=128,
-        #             find_unused_parameters=False,
-        #         )
-        #         self.prev_disjoint_classifier.eval()
+        if th.cuda.is_available() and dist.get_world_size() > 1:
+            self.use_ddp = True
+            if self.disjoint_classifier is not None:
+                self.disjoint_classifier = DDP(
+                    self.disjoint_classifier,
+                    device_ids=[dist_util.dev()],
+                    output_device=dist_util.dev(),
+                    broadcast_buffers=False,
+                    bucket_cap_mb=128,
+                    find_unused_parameters=False,
+                )
 
-        # else:
-        #     if dist.get_world_size() > 1:
-        #         logger.warn(
-        #             "Distributed training requires CUDA. "
-        #             "Gradients will not be synchronized properly!"
-        #         )
-        self.use_ddp = False
-        self.ddp_model = self.model
-        self.prev_ddp_model = self.prev_model
+        else:
+            if dist.get_world_size() > 1:
+                logger.warn(
+                    "Distributed training requires CUDA. "
+                    "Gradients will not be synchronized properly!"
+                )
+            self.use_ddp = False
+            self.ddp_model = self.model
+            self.prev_ddp_model = self.prev_model
 
         self.global_steps_before = global_steps_before
         self.cl_method = cl_method
@@ -494,7 +485,6 @@ class TrainLoop:
                         if i == 0:
                             self.disjoint_classifier_optimizer.zero_grad()
                         loss = loss.mean() * len(micro) / len(batch)
-                        print(len(micro) / len(batch))
                         loss.backward()
 
                     self.disjoint_classifier_optimizer.step()
