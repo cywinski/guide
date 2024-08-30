@@ -167,6 +167,8 @@ class TrainLoop:
 
         self.sync_cuda = th.cuda.is_available()
 
+        self.sr_model = self.sr_model.to(dist_util.dev())
+
         self._load_and_sync_parameters()
         self.classifier_first_task_dir = classifier_first_task_dir
 
@@ -319,6 +321,12 @@ class TrainLoop:
                 )
             )
             dist_util.sync_params(self.model.parameters())
+        self.sr_model.load_state_dict(
+                dist_util.load_state_dict(
+                    self.params.sr_model_path, map_location=dist_util.dev()
+                )
+            )
+        dist_util.sync_params(self.sr_model.parameters())
 
     def _load_ema_parameters(self, rate):
         ema_params = copy.deepcopy(self.mp_trainer.master_params)

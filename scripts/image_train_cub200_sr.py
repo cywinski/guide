@@ -10,38 +10,32 @@ import copy
 import os
 import time
 from collections import OrderedDict
-import torchvision
+
 import numpy as np
 import torch as th
+import torchvision
+
 th.set_float32_matmul_precision("high")
 
+
+import torch.distributed as dist
 
 import wandb
 from cl_methods.utils import get_cl_method
 from dataloaders import base
 from dataloaders.datasetGen import *
-from dataloaders.utils import prepare_eval_loaders
+from dataloaders.utils import prepare_eval_loaders, yielder
 from guide import dist_util, logger
 from guide.logger import wandb_safe_log
 from guide.resample import create_named_schedule_sampler
-from guide.script_args import (
-    add_dict_to_argparser,
-    all_training_defaults,
-    args_to_dict,
-    classifier_defaults,
-    preprocess_args,
-)
-from guide.script_util import (
-    create_model_and_diffusion,
-    model_and_diffusion_defaults,
-    results_to_log,
-    sr_create_model_and_diffusion,
-    sr_model_and_diffusion_defaults
-)
-from dataloaders.utils import yielder
-
+from guide.script_args import (add_dict_to_argparser, all_training_defaults,
+                               args_to_dict, classifier_defaults,
+                               preprocess_args)
+from guide.script_util import (create_model_and_diffusion,
+                               model_and_diffusion_defaults, results_to_log,
+                               sr_create_model_and_diffusion,
+                               sr_model_and_diffusion_defaults)
 from guide.train_util_cub200_sr import TrainLoop, calculate_accuracy
-import torch.distributed as dist
 
 # os.environ["WANDB_MODE"] = "disabled"
 
@@ -146,10 +140,6 @@ def run_training_with_args(args):
     sr_model, sr_diffusion = sr_create_model_and_diffusion(
         **args_to_dict(args, sr_model_and_diffusion_defaults().keys())
     )
-    sr_model.load_state_dict(
-        dist_util.load_state_dict(args.sr_model_path, map_location="cpu")
-    )
-    sr_model.to(dist_util.dev())
 
     logger.log("Loading pretrained ResNet18 model...")
     classifier = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
