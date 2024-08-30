@@ -136,6 +136,7 @@ def all_training_defaults():
         diffusion_pretrained_dir=None,  # Directory contating trained diffusion models on each task. It effectively disables any training of the diffusion model.
         negate_old_grad=False,  # negate old gradient
         classifier_first_task_dir=None,
+        sr_model_path=None,
     )
     defaults.update(model_and_diffusion_defaults())
     return defaults

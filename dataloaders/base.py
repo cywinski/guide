@@ -532,7 +532,7 @@ def Flowers102(
         102,
     )
 
-def CUB200(dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False):
+def CUB200(dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False, imagenet_norm_stats=True):
     train_test_split_file = os.path.join(
         dataroot, "CUB_200_2011", "train_test_split.txt"
     )
@@ -541,8 +541,12 @@ def CUB200(dataroot, skip_normalization=False, train_aug=False, classifier_augme
 
     train_transform_clf = None
     train_transform_diff = None
-    mean = [0.485, 0.456, 0.406]
-    std=[0.229, 0.224, 0.225]
+    if imagenet_norm_stats:
+        mean = [0.485, 0.456, 0.406]
+        std=[0.229, 0.224, 0.225]
+    else:
+        mean = [0.5, 0.5, 0.5]
+        std=[0.5, 0.5, 0.5]
 
     # augmentation for classifier training
     if classifier_augmentation:
@@ -610,10 +614,14 @@ def CUB200(dataroot, skip_normalization=False, train_aug=False, classifier_augme
         200,
     )
 
-def ImageNet(dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False):
+def ImageNet(dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False, imagenet_norm_stats=True):
     target_transform = transforms.Lambda(lambda y: torch.eye(1000)[y])
-    mean = [0.485, 0.456, 0.406]
-    std=[0.229, 0.224, 0.225]
+    if imagenet_norm_stats:
+        mean = [0.485, 0.456, 0.406]
+        std=[0.229, 0.224, 0.225]
+    else:
+        mean = [0.5, 0.5, 0.5]
+        std=[0.5, 0.5, 0.5]
 
     train_transform_clf = None
 

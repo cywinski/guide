@@ -35,10 +35,12 @@ from guide.script_util import (
     create_model_and_diffusion,
     model_and_diffusion_defaults,
     results_to_log,
+    sr_create_model_and_diffusion,
+    sr_model_and_diffusion_defaults
 )
 from dataloaders.utils import yielder
 
-from guide.train_util_cub200 import TrainLoop, calculate_accuracy
+from guide.train_util_cub200_sr import TrainLoop, calculate_accuracy
 import torch.distributed as dist
 
 # os.environ["WANDB_MODE"] = "disabled"
@@ -107,14 +109,47 @@ def run_training_with_args(args):
     logger.info(f"Len train ImageNet dataset = {len(train_dataset_imagenet)}")
     logger.info(f"Len val ImageNet dataset = {len(val_dataset_imagenet)}")
 
-    args.image_size = image_size
     args.in_channels = image_channels
     args.model_num_classes = 1000
 
-    logger.log("creating model and diffusion...")
+    #### LOW_RES PARAMETERS ####
+    args.image_size = 64
+    args.num_channels = 192
+    args.num_head_channels = 64
+    args.learn_sigma = True
+    args.noise_schedule = "cosine"
+    args.num_res_blocks = 3
+    args.resblock_updown = True
+    args.use_new_attention_order =True
+    args.use_scale_shift_norm = True
+
+    logger.log("creating low_res model and diffusion...")
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
+
+    #### SUPER_RES PARAMETERS ####
+    args.image_size = 256
+    args.large_size = 256
+    args.small_size = 64
+    args.num_channels = 192
+    args.learn_sigma = True
+    args.noise_schedule = "linear"
+    args.num_res_blocks = 2
+    args.num_heads =4
+    args.resblock_updown = True
+    args.use_new_attention_order = False
+    args.use_scale_shift_norm = True
+    args.sigma_small = False
+
+    logger.log("creating sr model and diffusion...")
+    sr_model, sr_diffusion = sr_create_model_and_diffusion(
+        **args_to_dict(args, sr_model_and_diffusion_defaults().keys())
+    )
+    sr_model.load_state_dict(
+        dist_util.load_state_dict(args.sr_model_path, map_location="cpu")
+    )
+    sr_model.to(dist_util.dev())
 
     logger.log("Loading pretrained ResNet18 model...")
     classifier = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
@@ -222,6 +257,8 @@ def run_training_with_args(args):
         train_noised_classifier=args.train_noised_classifier,
         val_loader_imagenet=val_loader_imagenet,
         val_loader_cub=val_loader_cub,
+        sr_model=sr_model,
+        sr_diffusion=sr_diffusion,
     )
 
     logger.log("validation...")

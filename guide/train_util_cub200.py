@@ -4,16 +4,18 @@ import os
 import time
 
 import blobfile as bf
+import kornia as K
 import numpy as np
 import torch as th
+
 th.set_float32_matmul_precision("high")
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
-from tqdm import tqdm
 from torchvision.utils import make_grid
+from tqdm import tqdm
 
 import wandb
 from dataloaders.utils import yielder
@@ -23,7 +25,6 @@ from . import dist_util, logger
 from .logger import wandb_safe_log
 from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
-
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
 # 20-21 within the first ~1K steps of training.
@@ -231,6 +232,7 @@ class TrainLoop:
         self.cl_method = cl_method
         self.val_loader_imagenet = val_loader_imagenet
         self.val_loader_cub = val_loader_cub
+        self.normalize = K.augmentation.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
     def _load_and_sync_parameters(self):
         prev_resume_checkpoint = None
@@ -439,6 +441,10 @@ class TrainLoop:
                     else:
                         generated_previous_examples = prev_generations
                         generated_previous_labels = prev_generations_labels
+
+                    generated_previous_examples = ((generated_previous_examples + 1) / 2).clamp(0, 1)
+                    generated_previous_examples = self.normalize(generated_previous_examples)
+
                     batch = th.cat([generated_previous_examples, real_examples])
                     extended_real_cond = th.cat(
                         [

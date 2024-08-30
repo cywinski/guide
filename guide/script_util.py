@@ -231,6 +231,7 @@ def sr_model_and_diffusion_defaults():
     res = model_and_diffusion_defaults()
     res["large_size"] = 256
     res["small_size"] = 64
+    res["sigma_small"] = False
     arg_names = inspect.getfullargspec(sr_create_model_and_diffusion)[0]
     for k in res.copy().keys():
         if k not in arg_names:
@@ -261,6 +262,7 @@ def sr_create_model_and_diffusion(
     use_scale_shift_norm,
     resblock_updown,
     use_fp16,
+    model_num_classes=None,
 ):
     model = sr_create_model(
         large_size,
@@ -277,6 +279,7 @@ def sr_create_model_and_diffusion(
         dropout=dropout,
         resblock_updown=resblock_updown,
         use_fp16=use_fp16,
+        num_classes=model_num_classes,
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
@@ -307,6 +310,7 @@ def sr_create_model(
     dropout,
     resblock_updown,
     use_fp16,
+    num_classes,
 ):
     _ = small_size  # hack to prevent unused variable
 
@@ -339,6 +343,7 @@ def sr_create_model(
         use_scale_shift_norm=use_scale_shift_norm,
         resblock_updown=resblock_updown,
         use_fp16=use_fp16,
+        num_classes=num_classes,
     )
 
 

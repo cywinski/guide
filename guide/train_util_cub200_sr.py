@@ -4,6 +4,7 @@ import os
 import time
 
 import blobfile as bf
+import kornia as K
 import numpy as np
 import torch as th
 
@@ -13,8 +14,8 @@ import torch.nn.functional as F
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
-from tqdm import tqdm
 from torchvision.utils import make_grid
+from tqdm import tqdm
 
 import wandb
 from dataloaders.utils import yielder
@@ -24,8 +25,6 @@ from . import dist_util, logger
 from .logger import wandb_safe_log
 from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
-from guide.train_util_cub200 import calculate_accuracy
-
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
 # 20-21 within the first ~1K steps of training.
@@ -88,13 +87,16 @@ class TrainLoop:
         train_noised_classifier=None,
         val_loader_imagenet=None,
         val_loader_cub=None,
-        train_yielder_imagenet=None,
+        sr_model=None,
+        sr_diffusion=None,
     ):
         self.params = params
         self.task_id = task_id
         self.model = model
         self.prev_model = prev_model
         self.diffusion = diffusion
+        self.sr_model = sr_model
+        self.sr_diffusion = sr_diffusion
         self.data = data
         self.data_yielder = data_yielder
         self.data_loader = data_loader
@@ -115,6 +117,7 @@ class TrainLoop:
         self.resume_checkpoint = resume_checkpoint
         self.use_fp16 = use_fp16
         self.fp16_scale_growth = fp16_scale_growth
+        self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
         self.num_steps = num_steps
@@ -163,7 +166,8 @@ class TrainLoop:
         self.global_batch = self.batch_size * dist.get_world_size()
 
         self.sync_cuda = th.cuda.is_available()
-        self.scheduler_step = scheduler_step
+
+        self._load_and_sync_parameters()
         self.classifier_first_task_dir = classifier_first_task_dir
 
         self.disjoint_classifier_optimizer = th.optim.AdamW(
@@ -184,21 +188,51 @@ class TrainLoop:
                 if device_cap in ((7, 0), (8, 0), (9, 0)):
                     gpu_ok = True
             if gpu_ok:
+                self.prev_model = th.compile(self.prev_model)
+                logger.info("Diffusion model compiled")
                 self.disjoint_classifier = th.compile(self.disjoint_classifier)
                 logger.info("Classifier model compiled")
+                self.sr_model = th.compile(self.sr_model)
+                logger.info("SR model compiled")
 
+        self.prev_model = self.prev_model.to(dist_util.dev())
         if th.cuda.is_available() and dist.get_world_size() > 1:
             self.use_ddp = True
-            if self.disjoint_classifier is not None:
-                self.disjoint_classifier = DDP(
-                    self.disjoint_classifier,
-                    device_ids=[dist_util.dev()],
-                    output_device=dist_util.dev(),
-                    broadcast_buffers=False,
-                    bucket_cap_mb=128,
-                    find_unused_parameters=False,
-                )
-
+            self.prev_ddp_model = DDP(
+                self.prev_model,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=False,
+            )
+            self.prev_ddp_model.eval()
+            self.disjoint_classifier = DDP(
+                self.disjoint_classifier,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=False,
+            )
+            self.prev_disjoint_classifier = DDP(
+                self.prev_disjoint_classifier,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=False,
+            )
+            self.prev_disjoint_classifier.eval()
+            self.sr_model = DDP(
+                self.sr_model,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=False,
+            )
+            self.sr_model.eval()
         else:
             if dist.get_world_size() > 1:
                 logger.warn(
@@ -213,7 +247,7 @@ class TrainLoop:
         self.cl_method = cl_method
         self.val_loader_imagenet = val_loader_imagenet
         self.val_loader_cub = val_loader_cub
-        self.train_yielder_imagenet = train_yielder_imagenet
+        self.normalize = K.augmentation.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
     def _load_and_sync_parameters(self):
         prev_resume_checkpoint = None
@@ -270,11 +304,9 @@ class TrainLoop:
             # Fix the forever loading of the model when training on multiple GPUs:
             # https://github.com/openai/guided-diffusion/issues/23#issuecomment-1055499214
             self.prev_model.load_state_dict(
-                dist_util.load_state_dict(
-                    prev_resume_checkpoint, map_location=dist_util.dev()
-                )
+                dist_util.load_state_dict(prev_resume_checkpoint, map_location="cpu")
             )
-            dist_util.sync_params(self.prev_model.parameters())
+            # dist_util.sync_params(self.prev_model.parameters())
             self.prev_model.eval()
         # NOTE: Only load the current model if we are not training classifier
         if curr_resume_checkpoint and self.disjoint_classifier is None:
@@ -401,29 +433,42 @@ class TrainLoop:
                         prev_generations is None
                         or (self.step - 1) % self.guid_generation_interval == 0
                     ):
-                        generated_previous_examples, generated_previous_labels = next(
-                            self.train_yielder_imagenet
-                        )  # classes [0, 1000]
-                        prev_generations = generated_previous_examples.cpu()
-                        prev_generations_labels = generated_previous_labels.cpu()
+                        # Generate replay examples and shuffle them with the real ones.
+                        self.disjoint_classifier.eval()
+                        sampling_start = time.time()
+                        (
+                            generated_previous_examples,
+                            generated_previous_labels,
+                            generated_previous_examples_confidences,
+                        ) = self.generate_examples(
+                            self.task_id - 1,
+                            (self.batch_size // 2),
+                            batch_size=self.microbatch,
+                            equal_n_examples_per_class=True,
+                            use_old_grad=self.use_old_grad,
+                            use_new_grad=self.use_new_grad,
+                            only_one_task=True,
+                            real_examples=real_examples,  # needed for speedup generation
+                        )
+                        sampling_time += time.time() - sampling_start
+                        prev_generations = generated_previous_examples
+                        prev_generations_labels = generated_previous_labels
                     else:
                         generated_previous_examples = prev_generations
                         generated_previous_labels = prev_generations_labels
+
+                    generated_previous_examples = ((generated_previous_examples + 1) / 2).clamp(0, 1)
+                    generated_previous_examples = self.normalize(generated_previous_examples)
+
                     batch = th.cat([generated_previous_examples, real_examples])
                     extended_real_cond = th.cat(
                         [
-                            th.zeros(real_cond.size(0), 1000, device=real_cond.device),
+                            th.zeros(real_cond.size(0), 1000),
                             real_cond
                         ], dim=1
                     )
-                    extended_generation_labels = th.cat(
-                        [
-                            generated_previous_labels,
-                            th.zeros(generated_previous_labels.size(0), 200, device=generated_previous_labels.device),
-                        ], dim=1
-                    )
                     cond = {
-                        "y": th.cat([extended_generation_labels, extended_real_cond], dim=0)
+                        "y": th.cat([generated_previous_labels, extended_real_cond], dim=0)
                     }
                     shuffle = th.randperm(batch.shape[0])
                     batch = batch[shuffle]
@@ -448,6 +493,13 @@ class TrainLoop:
                         batch = self.train_transform_classifier(batch)
 
                     y = cond["y"]
+                    t = None
+
+                    if self.train_noised_classifier:
+                        t, _ = self.schedule_sampler.sample(
+                            batch.shape[0], dist_util.dev()
+                        )
+                        batch = self.diffusion.q_sample(batch, t)
 
                     for i in range(0, batch.shape[0], self.microbatch):
                         micro = batch[i : i + self.microbatch].to(dist_util.dev())
@@ -681,7 +733,7 @@ class TrainLoop:
                         norm_val = th.linalg.norm(grad_old.flatten(1), ord=th.inf)
                         grad_old = grad_old / norm_val
                     if not use_new_grad:
-                        return grad_old * classfier_scale_vec_old.view(-1, 1, 1, 1)
+                        return grad_old * self.classifier_scale_max_old
                 if use_new_grad:
                     logits_new = new_classifier_fn(x_in)
                     if self.trim_logits:
@@ -695,14 +747,14 @@ class TrainLoop:
                             ],
                             dim=-1,
                         )
-                        random_new_task_classes = (
+                        most_probable_new_task_classes = (
                             th.argmax(probs, dim=-1)
                             + max_class
                             + 1
                             - self.classes_per_task
                         )
                         loss_new = -F.cross_entropy(
-                            logits_new, random_new_task_classes, reduction="none"
+                            logits_new, most_probable_new_task_classes, reduction="none"
                         )
                     else:
                         loss_new = F.cross_entropy(logits_new, y, reduction="none")
@@ -711,11 +763,9 @@ class TrainLoop:
                         norm_val = th.linalg.norm(grad_new.flatten(1), ord=th.inf)
                         grad_new = grad_new / norm_val
                     if use_old_grad:
-                        return grad_old * classfier_scale_vec_old.view(
-                            -1, 1, 1, 1
-                        ) + grad_new * classfier_scale_vec_new.view(-1, 1, 1, 1)
+                        return grad_old * self.classifier_scale_max_old + grad_new * self.classifier_scale_max_new
                     else:
-                        return grad_new * classfier_scale_vec_new.view(-1, 1, 1, 1)
+                        return grad_new * self.classifier_scale_max_new
 
         with tqdm(total=total_num_examples, leave=False) as progress_bar:
             while len(all_images) * batch_size < total_num_examples:
@@ -727,43 +777,19 @@ class TrainLoop:
                 )
 
                 model_kwargs["y"] = classes
-
-                if self.disjoint_classifier is not None and use_old_grad:
-                    classfier_scale_vec_old = (
-                        th.from_numpy(
-                            np.random.uniform(
-                                low=self.classifier_scale_min_old,
-                                high=self.classifier_scale_max_old,
-                                size=(len(classes),),
-                            )
-                        )
-                        .float()
-                        .to(dist_util.dev())
-                    )
-                if self.disjoint_classifier is not None and use_new_grad:
-                    classfier_scale_vec_new = (
-                        th.from_numpy(
-                            np.random.uniform(
-                                low=self.classifier_scale_min_new,
-                                high=self.classifier_scale_max_new,
-                                size=(len(classes),),
-                            )
-                        )
-                        .float()
-                        .to(dist_util.dev())
-                    )
                 sample_fn = (
                     diffusion.ddim_sample_loop
                     if self.use_ddim
                     else diffusion.p_sample_loop
                 )
-                sample = sample_fn(
+                # Sample low res images
+                sample_low_res = sample_fn(
                     self.prev_ddp_model,
                     (
                         len(classes),
                         self.in_channels,
-                        self.image_size,
-                        self.image_size,
+                        self.image_size//4,
+                        self.image_size//4,
                     ),
                     clip_denoised=self.params.clip_denoised,
                     model_kwargs=model_kwargs,
@@ -776,6 +802,22 @@ class TrainLoop:
                             and (use_old_grad or use_new_grad)
                         )
                     ),
+                )
+
+                # Now upsample to 256x256
+                model_kwargs["low_res"] = sample_low_res
+                sample = self.sr_diffusion.p_sample_loop(
+                    self.sr_model,
+                    (
+                        len(classes),
+                        self.in_channels,
+                        self.image_size,
+                        self.image_size,
+                    ),
+                    clip_denoised=self.params.clip_denoised,
+                    model_kwargs=model_kwargs,
+                    device=dist_util.dev(),
+                    compute_grads=False,
                 )
 
                 sample = sample.detach()
@@ -968,3 +1010,47 @@ def prepare_diffusion(args, timestep_respacing):
         rescale_learned_sigmas=args.rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
     )
+
+
+def calculate_accuracy(model, validation_loader, is_cub=False):
+    model.eval()  # Set the model to evaluation mode
+    correct_top1 = 0
+    correct_top5 = 0
+    total = 0
+
+    with th.no_grad():  # Disable gradient calculation
+        for inputs, labels in tqdm(validation_loader, total=len(validation_loader)):
+            inputs, labels = inputs.to(dist_util.dev()), labels.to(dist_util.dev())
+
+            outputs = model(inputs)
+            if is_cub:
+                extended_labels = th.cat(
+                    (th.zeros(labels.size(0), 1000, device=dist_util.dev()), labels),
+                    dim=1,
+                )
+            else:
+                extended_labels = th.cat(
+                    (labels, th.zeros(labels.size(0), 200, device=dist_util.dev())),
+                    dim=1,
+                )
+
+            # Convert one-hot to class indices
+            _, true_labels = th.max(extended_labels, 1)
+
+            # Top-1 accuracy
+            _, predicted_top1 = th.max(outputs.data, 1)
+            correct_top1 += (predicted_top1 == true_labels).sum().item()
+
+            # Top-5 accuracy
+            _, predicted_top5 = outputs.topk(5, 1, largest=True, sorted=True)
+            correct_top5 += (
+                th.eq(predicted_top5, true_labels.view(-1, 1).expand_as(predicted_top5))
+                .sum()
+                .item()
+            )
+
+            total += labels.size(0)
+
+    accuracy_top1 = correct_top1 / total
+    accuracy_top5 = correct_top5 / total
+    return accuracy_top1, accuracy_top5
