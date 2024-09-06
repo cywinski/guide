@@ -64,6 +64,7 @@ def model_and_diffusion_defaults():
         model_num_classes=None,
         in_channels=3,
         train_noised_classifier=False,
+        embedding_kind="add_time_learned"
     )
     res.update(diffusion_defaults())
     return res
@@ -137,6 +138,8 @@ def all_training_defaults():
         negate_old_grad=False,  # negate old gradient
         classifier_first_task_dir=None,
         sr_model_path=None,
+        num_epochs=None,
+        standard_norm_stats=False,
     )
     defaults.update(model_and_diffusion_defaults())
     return defaults

@@ -445,6 +445,7 @@ class UNetModel(nn.Module):
         use_scale_shift_norm=False,
         resblock_updown=False,
         use_new_attention_order=False,
+        embedding_kind="add_time_learned",
     ):
         super().__init__()
 
@@ -467,15 +468,15 @@ class UNetModel(nn.Module):
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
 
+        self.embedding_kind = embedding_kind
         time_embed_dim = model_channels * 4
-        self.time_embed = nn.Sequential(
-            linear(model_channels, time_embed_dim),
-            nn.SiLU(),
-            linear(time_embed_dim, time_embed_dim),
-        )
+        self.time_embed = self._get_time_embedding(time_embed_dim)
 
         if self.num_classes is not None:
-            self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+            if embedding_kind == "add_time_learned":
+                self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+            else:
+                self.label_emb = lambda x: F.one_hot(x.long(), self.num_classes)
 
         ch = input_ch = int(channel_mult[0] * model_channels)
         self.input_blocks = nn.ModuleList(
@@ -649,7 +650,8 @@ class UNetModel(nn.Module):
 
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
-            emb = emb + self.label_emb(y)
+            # emb = emb + self.label_emb(y)
+            emb = self._add_label_embedding(emb, y)
 
         h = x.type(self.dtype)
         for module in self.input_blocks:
@@ -661,6 +663,28 @@ class UNetModel(nn.Module):
             h = module(h, emb)
         h = h.type(x.dtype)
         return self.out(h)
+
+    def _add_label_embedding(self, emb, y):
+        if self.embedding_kind == "add_time_learned":
+            emb = emb + self.label_emb(y)
+        elif self.embedding_kind == "concat_time_1hot":
+            emb = th.cat([emb, self.label_emb(y)], 1)
+        else:
+            assert False, "bad embedding kind!"
+        return emb
+
+    def _get_time_embedding(self, time_embed_dim):
+        dim_mid = time_embed_dim
+        if self.embedding_kind == "concat_time_1hot" and self.num_classes is not None:
+            dim_out = time_embed_dim - self.num_classes
+        else:
+            dim_out = time_embed_dim
+
+        return nn.Sequential(
+            linear(self.model_channels, dim_mid),
+            nn.SiLU(),
+            linear(time_embed_dim, dim_out),
+        )
 
 
 class SuperResModel(UNetModel):
