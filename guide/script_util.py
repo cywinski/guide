@@ -70,6 +70,7 @@ def create_model_and_diffusion(
         rescale_timesteps=rescale_timesteps,
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
+        embedding_kind=embedding_kind,
     )
     return model, diffusion
 
@@ -179,6 +180,7 @@ def create_classifier_and_diffusion(
         rescale_timesteps=rescale_timesteps,
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
+        embedding_kind=embedding_kind,
     )
     return classifier, diffusion
 
@@ -295,6 +297,7 @@ def sr_create_model_and_diffusion(
         rescale_timesteps=rescale_timesteps,
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
+        embedding_kind=embedding_kind,
     )
     return model, diffusion
 
@@ -362,8 +365,12 @@ def create_gaussian_diffusion(
     rescale_timesteps=False,
     rescale_learned_sigmas=False,
     timestep_respacing="",
+    embedding_kind="add_time_learned",
 ):
-    betas = gd.get_named_beta_schedule(noise_schedule, steps)
+    if embedding_kind == "concat_time_1hot":
+        betas = gd.get_named_beta_schedule_legacy(noise_schedule, steps)
+    else:
+        betas = gd.get_named_beta_schedule(noise_schedule, steps)
     if use_kl:
         loss_type = gd.LossType.RESCALED_KL
     elif rescale_learned_sigmas:
