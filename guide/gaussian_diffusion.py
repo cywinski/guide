@@ -15,6 +15,38 @@ from .nn import mean_flat
 from .losses import normal_kl, discretized_gaussian_log_likelihood
 
 
+def get_named_beta_schedule_legacy(schedule_name, num_diffusion_timesteps):
+    """
+    Get a pre-defined beta schedule for the given name.
+
+    The beta schedule library consists of beta schedules which remain similar
+    in the limit of num_diffusion_timesteps.
+    Beta schedules may be added, but should not be removed or changed once
+    they are committed to maintain backwards compatibility.
+    """
+    if num_diffusion_timesteps < 10:
+        scale = 100 / num_diffusion_timesteps
+        multiply = 0.01
+    else:
+        scale = 1000 / num_diffusion_timesteps
+        multiply = 0.001
+    if schedule_name == "linear":
+        # Linear schedule from Ho et al, extended to work for any number of
+        # diffusion steps.
+        beta_start = scale * multiply
+        beta_end = scale * 0.02
+        return np.linspace(
+            beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64
+        )
+    elif schedule_name == "cosine":
+        return betas_for_alpha_bar(
+            num_diffusion_timesteps,
+            lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2,
+        )
+    else:
+        raise NotImplementedError(f"unknown beta schedule: {schedule_name}")
+
+
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
     """
     Get a pre-defined beta schedule for the given name.
