@@ -159,7 +159,7 @@ def run_training_with_args(args):
 
     train_loader = th.utils.data.DataLoader(
         dataset=train_dataset_cub,
-        batch_size=args.batch_size // 2,
+        batch_size=args.batch_size,
         shuffle=True,
         drop_last=True,
         generator=random_generator,
@@ -169,7 +169,8 @@ def run_training_with_args(args):
     train_loop = None
     cl_method = get_cl_method(args)
     global_step = 0
-    num_steps = args.disjoint_classifier_init_num_steps
+    num_steps = len(train_dataset_cub) // args.batch_size
+    print(f"num_steps: {num_steps}")
 
     train_loop = TrainLoop(
         params=args,

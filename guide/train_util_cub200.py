@@ -166,16 +166,17 @@ class TrainLoop:
         self._load_and_sync_parameters()
         self.classifier_first_task_dir = classifier_first_task_dir
 
-        self.disjoint_classifier_optimizer = th.optim.AdamW(
-            self.disjoint_classifier.parameters(),
-            lr=(
-                self.params.classifier_lr
-                if self.task_id != 0
-                else self.params.classifier_init_lr
-            ),
-            weight_decay=self.params.classifier_weight_decay,
-        )
-        self.num_batches_per_epoch = len(self.data) // (self.global_batch // 2)
+        self.disjoint_classifier_optimizer = th.optim.SGD(
+                self.disjoint_classifier.parameters(),
+                lr=(
+                    self.params.classifier_lr
+                    if self.task_id != 0
+                    else self.params.classifier_init_lr
+                ),
+                weight_decay=self.params.classifier_weight_decay,
+                momentum=0.9,
+            )
+        self.num_batches_per_epoch = len(self.data) // self.global_batch
 
         if th.__version__ >= "2.0" and dist.get_world_size() == 1:
             gpu_ok = False
@@ -427,7 +428,7 @@ class TrainLoop:
                             generated_previous_examples_confidences,
                         ) = self.generate_examples(
                             self.task_id - 1,
-                            (self.batch_size // 2),
+                            self.batch_size,
                             batch_size=self.microbatch,
                             equal_n_examples_per_class=True,
                             use_old_grad=self.use_old_grad,
