@@ -632,7 +632,7 @@ def CUB200(dataroot, skip_normalization=False, train_aug=False, classifier_augme
         200,
     )
 
-def ImageNet(dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False, imagenet_norm_stats=True):
+def ImageNet(dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False, imagenet_norm_stats=True, limit_samples=None):
     target_transform = transforms.Lambda(lambda y: torch.eye(1000)[y])
     if imagenet_norm_stats:
         mean = [0.485, 0.456, 0.406]
@@ -664,6 +664,11 @@ def ImageNet(dataroot, skip_normalization=False, train_aug=False, classifier_aug
         ),
         target_transform=target_transform,
     )
+    if limit_samples is not None:
+        random_indices = np.random.choice(len(train_dataset), limit_samples, replace=False)
+        train_dataset = torch.utils.data.Subset(train_dataset, random_indices)
+        train_dataset.root = dataroot
+
     val_dataset = torchvision.datasets.ImageFolder(
         root=os.path.join(dataroot, "imagenet", "val"),
         transform=transforms.Compose(
@@ -677,6 +682,8 @@ def ImageNet(dataroot, skip_normalization=False, train_aug=False, classifier_aug
         ),
         target_transform=target_transform,
     )
+
+
     # val_dataset.root = dataroot
     # val_dataset = CacheClassLabel(
     #     val_dataset,
