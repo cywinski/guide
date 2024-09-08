@@ -22,7 +22,7 @@ class FastDataset(Dataset):
 
 
 def CIFAR10(
-    dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False
+    dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False, standard_norm_stats=True
 ):
     train_transform_clf = None
     train_transform_diff = None
@@ -32,16 +32,23 @@ def CIFAR10(
             K.augmentation.RandomHorizontalFlip(),
         )
 
+    if standard_norm_stats:
+        mean = [0.5, 0.5, 0.5]
+        std=[0.5, 0.5, 0.5]
+    else:
+        mean =[0.4914, 0.4822, 0.4465]
+        std = [0.2470, 0.2435, 0.2616]
+
     # augmentation for classifier training
     if classifier_augmentation:
         train_transform_clf = K.augmentation.ImageSequential(
-            K.augmentation.Denormalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            K.augmentation.Denormalize(mean, std),
             K.augmentation.RandomCrop((32, 32), padding=4),
             K.augmentation.RandomRotation(30),
             K.augmentation.RandomHorizontalFlip(),
             K.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1),
             K.augmentation.RandomErasing(scale=(0.1, 0.5)),
-            K.augmentation.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            K.augmentation.Normalize(mean, std),
         )
 
     target_transform = transforms.Lambda(lambda y: torch.eye(10)[y])
@@ -53,7 +60,7 @@ def CIFAR10(
         transform=transforms.Compose(
             [
                 transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                transforms.Normalize(mean, std),
             ]
         ),
         target_transform=target_transform,
@@ -70,7 +77,7 @@ def CIFAR10(
         transform=transforms.Compose(
             [
                 transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                transforms.Normalize(mean, std),
             ]
         ),
         target_transform=target_transform,
@@ -106,11 +113,13 @@ def CIFAR10(
         train_transform_clf,
         train_transform_diff,
         10,
+        mean,
+        std,
     )
 
 
 def CIFAR100(
-    dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False
+    dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False, standard_norm_stats=True
 ):
     train_transform_clf = None
     train_transform_diff = None
@@ -120,16 +129,23 @@ def CIFAR100(
             K.augmentation.RandomHorizontalFlip(),
         )
 
+    if standard_norm_stats:
+        mean = [0.5, 0.5, 0.5]
+        std=[0.5, 0.5, 0.5]
+    else:
+        mean =[0.5071, 0.4865, 0.4409]
+        std = [0.2673, 0.2564, 0.2762]
+
     # augmentation for classifier training
     if classifier_augmentation:
         train_transform_clf = K.augmentation.ImageSequential(
-            K.augmentation.Denormalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            K.augmentation.Denormalize(mean, std),
             K.augmentation.RandomCrop((32, 32), padding=4),
             K.augmentation.RandomRotation(30),
             K.augmentation.RandomHorizontalFlip(),
             K.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1),
             K.augmentation.RandomErasing(scale=(0.1, 0.5)),
-            K.augmentation.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            K.augmentation.Normalize(mean, std),
         )
 
     target_transform = transforms.Lambda(lambda y: torch.eye(100)[y])
@@ -141,7 +157,7 @@ def CIFAR100(
         transform=transforms.Compose(
             [
                 transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                transforms.Normalize(mean, std),
             ]
         ),
         target_transform=target_transform,
@@ -158,7 +174,7 @@ def CIFAR100(
         transform=transforms.Compose(
             [
                 transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                transforms.Normalize(mean, std),
             ]
         ),
         target_transform=target_transform,
@@ -195,6 +211,8 @@ def CIFAR100(
         train_transform_clf,
         train_transform_diff,
         100,
+        mean,
+        std
     )
 
 

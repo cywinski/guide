@@ -35,7 +35,7 @@ from guide.script_util import (
     model_and_diffusion_defaults,
     results_to_log,
 )
-from guide.train_util import TrainLoop
+from guide.train_util_new import TrainLoop
 from guide.validation import calculate_accuracy_with_classifier
 
 # os.environ["WANDB_MODE"] = "disabled"
@@ -83,6 +83,7 @@ def run_training_with_args(args):
         train_aug=args.train_aug,
         skip_normalization=args.skip_normalization,
         classifier_augmentation=args.classifier_augmentation,
+        standard_norm_stats=args.standard_norm_stats,
     )
 
     args.image_size = image_size
@@ -126,7 +127,7 @@ def run_training_with_args(args):
             )
 
     schedule_sampler = create_named_schedule_sampler(
-        args.schedule_sampler, diffusion, args
+        args.schedule_sampler, diffusion
     )
 
     logger.log("creating data loaders...")
@@ -191,12 +192,19 @@ def run_training_with_args(args):
             if not args.train_with_disjoint_classifier:
                 num_steps = args.first_task_num_steps
             else:
-                num_steps = args.disjoint_classifier_init_num_steps
+                if args.num_epochs is not None:
+                    num_steps = len(train_dataset_splits[task_id]) // (args.batch_size // (task_id + 1))
+                else:
+                    num_steps = args.disjoint_classifier_init_num_steps
         else:
             if not args.train_with_disjoint_classifier:
                 num_steps = args.num_steps
             else:
-                num_steps = args.disjoint_classifier_num_steps
+                if args.num_epochs is not None:
+                    num_steps = len(train_dataset_splits[task_id]) // (args.batch_size // (task_id + 1))
+                else:
+                    num_steps = args.disjoint_classifier_num_steps
+        print(f"num_steps: {num_steps}")
 
         train_loop = TrainLoop(
             params=args,

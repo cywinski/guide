@@ -35,7 +35,7 @@ from guide.script_util import (
     model_and_diffusion_defaults,
     results_to_log,
 )
-from guide.train_util import TrainLoop
+from guide.train_util_online import TrainLoop
 from guide.validation import calculate_accuracy_with_classifier
 
 # os.environ["WANDB_MODE"] = "disabled"
@@ -83,6 +83,7 @@ def run_training_with_args(args):
         train_aug=args.train_aug,
         skip_normalization=args.skip_normalization,
         classifier_augmentation=args.classifier_augmentation,
+        standard_norm_stats=args.standard_norm_stats,
     )
 
     args.image_size = image_size
@@ -126,7 +127,7 @@ def run_training_with_args(args):
             )
 
     schedule_sampler = create_named_schedule_sampler(
-        args.schedule_sampler, diffusion, args
+        args.schedule_sampler, diffusion
     )
 
     logger.log("creating data loaders...")
@@ -187,16 +188,8 @@ def run_training_with_args(args):
                 ((task_id + 1) * (n_classes // n_tasks)) - 1
             ) + args.first_task_num_classes
 
-        if task_id == 0:
-            if not args.train_with_disjoint_classifier:
-                num_steps = args.first_task_num_steps
-            else:
-                num_steps = args.disjoint_classifier_init_num_steps
-        else:
-            if not args.train_with_disjoint_classifier:
-                num_steps = args.num_steps
-            else:
-                num_steps = args.disjoint_classifier_num_steps
+        num_steps = len(train_dataset_splits[task_id]) // args.batch_size
+        print(f"num_steps: {num_steps}")
 
         train_loop = TrainLoop(
             params=args,

@@ -4,27 +4,29 @@ import os
 import time
 
 import blobfile as bf
-import kornia as K
 import numpy as np
-import torch as th
+import kornia as K
 
-th.set_float32_matmul_precision("high")
+import torch as th
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
-from torchvision.utils import make_grid
 from tqdm import tqdm
+th.set_float32_matmul_precision("high")
 
+from torchvision.utils import make_grid
 import wandb
 from dataloaders.utils import yielder
 from dataloaders.wrapper import AppendName
 
 from . import dist_util, logger
+from .fp16_util import MixedPrecisionTrainer
 from .logger import wandb_safe_log
 from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
+
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
 # 20-21 within the first ~1K steps of training.
@@ -85,18 +87,15 @@ class TrainLoop:
         random_generator=None,
         classifier_first_task_dir=None,
         train_noised_classifier=None,
-        val_loader_imagenet=None,
-        val_loader_cub=None,
-        sr_model=None,
-        sr_diffusion=None,
+        mean_norm=None,
+        std_norm=None,
+        prev_yielder=None,
     ):
         self.params = params
         self.task_id = task_id
         self.model = model
         self.prev_model = prev_model
         self.diffusion = diffusion
-        self.sr_model = sr_model
-        self.sr_diffusion = sr_diffusion
         self.data = data
         self.data_yielder = data_yielder
         self.data_loader = data_loader
@@ -167,21 +166,34 @@ class TrainLoop:
 
         self.sync_cuda = th.cuda.is_available()
 
-        self.sr_model = self.sr_model.to(dist_util.dev())
-
-        self._load_and_sync_parameters()
+        self.scheduler_step = scheduler_step
         self.classifier_first_task_dir = classifier_first_task_dir
 
-        self.disjoint_classifier_optimizer = th.optim.AdamW(
-            self.disjoint_classifier.parameters(),
-            lr=(
-                self.params.classifier_lr
-                if self.task_id != 0
-                else self.params.classifier_init_lr
-            ),
-            weight_decay=self.params.classifier_weight_decay,
-        )
-        self.num_batches_per_epoch = len(self.data) // (self.global_batch // 2)
+        if self.disjoint_classifier is not None:
+            self.disjoint_classifier_optimizer = th.optim.SGD(
+                self.disjoint_classifier.parameters(),
+                lr=(
+                    self.params.classifier_lr
+                    if self.task_id != 0
+                    else self.params.classifier_init_lr
+                ),
+                weight_decay=self.params.classifier_weight_decay,
+                momentum=0.9,
+            )
+            self.num_batches_per_epoch = len(self.data) // (self.batch_size // (self.task_id + 1))
+
+        if self.resume_step:
+            self._load_optimizer_state()
+            # Model was resumed, either due to a restart or a checkpoint
+            # being specified at the command line.
+            self.ema_params = [
+                self._load_ema_parameters(rate) for rate in self.ema_rate
+            ]
+        else:
+            self.ema_params = [
+                copy.deepcopy(self.mp_trainer.master_params)
+                for _ in range(len(self.ema_rate))
+            ]
 
         if th.__version__ >= "2.0" and dist.get_world_size() == 1:
             gpu_ok = False
@@ -190,51 +202,31 @@ class TrainLoop:
                 if device_cap in ((7, 0), (8, 0), (9, 0)):
                     gpu_ok = True
             if gpu_ok:
-                self.prev_model = th.compile(self.prev_model)
-                logger.info("Diffusion model compiled")
-                self.disjoint_classifier = th.compile(self.disjoint_classifier)
-                logger.info("Classifier model compiled")
-                self.sr_model = th.compile(self.sr_model)
-                logger.info("SR model compiled")
+                if self.disjoint_classifier is not None:
+                    self.disjoint_classifier = th.compile(self.disjoint_classifier)
+                    logger.info("Classifier model compiled")
 
-        self.prev_model = self.prev_model.to(dist_util.dev())
         if th.cuda.is_available() and dist.get_world_size() > 1:
             self.use_ddp = True
-            self.prev_ddp_model = DDP(
-                self.prev_model,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
-            )
-            self.prev_ddp_model.eval()
-            self.disjoint_classifier = DDP(
-                self.disjoint_classifier,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
-            )
-            self.prev_disjoint_classifier = DDP(
-                self.prev_disjoint_classifier,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
-            )
-            self.prev_disjoint_classifier.eval()
-            self.sr_model = DDP(
-                self.sr_model,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
-            )
-            self.sr_model.eval()
+            if self.disjoint_classifier is not None:
+                self.disjoint_classifier = DDP(
+                    self.disjoint_classifier,
+                    device_ids=[dist_util.dev()],
+                    output_device=dist_util.dev(),
+                    broadcast_buffers=False,
+                    bucket_cap_mb=128,
+                    find_unused_parameters=False,
+                )
+                self.prev_disjoint_classifier = DDP(
+                    self.prev_disjoint_classifier,
+                    device_ids=[dist_util.dev()],
+                    output_device=dist_util.dev(),
+                    broadcast_buffers=False,
+                    bucket_cap_mb=128,
+                    find_unused_parameters=False,
+                )
+                self.prev_disjoint_classifier.eval()
+
         else:
             if dist.get_world_size() > 1:
                 logger.warn(
@@ -247,9 +239,7 @@ class TrainLoop:
 
         self.global_steps_before = global_steps_before
         self.cl_method = cl_method
-        self.val_loader_imagenet = val_loader_imagenet
-        self.val_loader_cub = val_loader_cub
-        self.normalize = K.augmentation.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        self.normalize = K.augmentation.Normalize(mean=mean_norm, std=std_norm)
 
     def _load_and_sync_parameters(self):
         prev_resume_checkpoint = None
@@ -306,9 +296,11 @@ class TrainLoop:
             # Fix the forever loading of the model when training on multiple GPUs:
             # https://github.com/openai/guided-diffusion/issues/23#issuecomment-1055499214
             self.prev_model.load_state_dict(
-                dist_util.load_state_dict(prev_resume_checkpoint, map_location="cpu")
+                dist_util.load_state_dict(
+                    prev_resume_checkpoint, map_location=dist_util.dev()
+                )
             )
-            # dist_util.sync_params(self.prev_model.parameters())
+            dist_util.sync_params(self.prev_model.parameters())
             self.prev_model.eval()
         # NOTE: Only load the current model if we are not training classifier
         if curr_resume_checkpoint and self.disjoint_classifier is None:
@@ -321,12 +313,6 @@ class TrainLoop:
                 )
             )
             dist_util.sync_params(self.model.parameters())
-        self.sr_model.load_state_dict(
-                dist_util.load_state_dict(
-                    self.params.sr_model_path, map_location=dist_util.dev()
-                )
-            )
-        dist_util.sync_params(self.sr_model.parameters())
 
     def _load_ema_parameters(self, rate):
         ema_params = copy.deepcopy(self.mp_trainer.master_params)
@@ -359,209 +345,152 @@ class TrainLoop:
     def run_loop(self):
         if self.disjoint_classifier is not None:
             print("Training disjoint classifier...")
-            with tqdm(total=self.num_steps) as pbar:
-                epoch = 0
-                sampling_time = 0
-                prev_generations = None
-                prev_generations_labels = None
-                while self.step < self.num_steps:
-                    self.step += 1
-                    curr_epoch = (self.step - 1) // self.num_batches_per_epoch
-                    # Handle lr scheduling
-                    if curr_epoch != epoch:
-                        set_annealed_lr(
-                            self.disjoint_classifier_optimizer,
-                            (
-                                self.params.classifier_lr
-                                if self.task_id != 0
-                                else self.params.classifier_init_lr
-                            ),
-                            self.step / self.num_steps,
-                        )
-                        epoch = curr_epoch
-
-                        logger.log(f"validation epoch {epoch}...")
-                        validation_start_time = time.time()
-                        val_accuracy_imagenet_top1, val_accuracy_imagenet_top5 = (
-                            calculate_accuracy(
-                                self.disjoint_classifier,
-                                self.val_loader_imagenet,
-                                is_cub=False,
-                            )
-                        )
-                        val_accuracy_cub_top1, val_accuracy_cub_top5 = (
-                            calculate_accuracy(
-                                self.disjoint_classifier,
-                                self.val_loader_cub,
-                                is_cub=True,
-                            )
-                        )
-                        validation_time = time.time() - validation_start_time
-                        if logger.get_rank_without_mpi_import() == 0:
-                            wandb_safe_log(
-                                {
-                                    "test/accuracy_imagenet@1": val_accuracy_imagenet_top1,
-                                    "test/accuracy_cub200@1": val_accuracy_cub_top1,
-                                    "test/accuracy_imagenet@5": val_accuracy_imagenet_top5,
-                                    "test/accuracy_cub200@5": val_accuracy_cub_top5,
-                                },
-                                step=self.get_global_step(),
-                            )
-                            logger.log(
-                                f"Validation accuracy@1 on ImageNet: {val_accuracy_imagenet_top1}"
-                            )
-                            logger.log(
-                                f"Validation accuracy@5 on ImageNet: {val_accuracy_imagenet_top5}"
-                            )
-                            logger.log(
-                                f"Validation accuracy@1 on CUB-200: {val_accuracy_cub_top1}"
-                            )
-                            logger.log(
-                                f"Validation accuracy@5 on CUB-200: {val_accuracy_cub_top5}"
-                            )
-
-                            # save model each epoch
-                            logger.log(f"saving model epoch {epoch} ...")
-                            checkpoint = {
-                                "epoch": epoch,
-                                "model": self.disjoint_classifier,
-                                "optimizer": self.disjoint_classifier_optimizer,
-                            }
-                            th.save(
-                                checkpoint,
-                                os.path.join(
-                                    logger.get_dir(), f"disjoint_clf_epoch{epoch}.pt"
-                                ),
-                            )
-
-                    real_examples, real_cond = next(
-                        self.data_yielder
-                    )  # classes [0, 200]
-                    if (
-                        prev_generations is None
-                        or (self.step - 1) % self.guid_generation_interval == 0
-                    ):
-                        # Generate replay examples and shuffle them with the real ones.
-                        self.disjoint_classifier.eval()
-                        sampling_start = time.time()
-                        (
-                            generated_previous_examples,
-                            generated_previous_labels,
-                            generated_previous_examples_confidences,
-                        ) = self.generate_examples(
-                            self.task_id - 1,
-                            (self.batch_size // 2),
-                            batch_size=self.microbatch,
-                            equal_n_examples_per_class=True,
-                            use_old_grad=self.use_old_grad,
-                            use_new_grad=self.use_new_grad,
-                            only_one_task=True,
-                            real_examples=real_examples,  # needed for speedup generation
-                        )
-                        sampling_time += time.time() - sampling_start
-                        prev_generations = generated_previous_examples
-                        prev_generations_labels = generated_previous_labels
-                    else:
-                        generated_previous_examples = prev_generations
-                        generated_previous_labels = prev_generations_labels
-
-                    generated_previous_examples = ((generated_previous_examples + 1) / 2).clamp(0, 1)
-                    generated_previous_examples = self.normalize(generated_previous_examples)
-
-                    batch = th.cat([generated_previous_examples, real_examples])
-                    extended_real_cond = th.cat(
-                        [
-                            th.zeros(real_cond.size(0), 1000),
-                            real_cond
-                        ], dim=1
+            if (self.task_id == 0) and (self.classifier_first_task_dir is not None):
+                self.disjoint_classifier.module.load_state_dict(
+                    dist_util.load_state_dict(
+                        self.classifier_first_task_dir, map_location=dist_util.dev()
                     )
-                    cond = {
-                        "y": th.cat([generated_previous_labels, extended_real_cond], dim=0)
-                    }
-                    shuffle = th.randperm(batch.shape[0])
-                    batch = batch[shuffle]
-                    cond["y"] = cond["y"][shuffle]
-                    if (
-                        logger.get_rank_without_mpi_import() == 0
-                        and (self.step - 1) % self.log_interval == 0
-                    ):
-                        samples_grid = make_grid(
-                            generated_previous_examples[:self.microbatch],
-                            normalize=True,
-                        )
-                        wandb.log(
-                            {f"generated_examples": wandb.Image(samples_grid)},
-                            step=self.get_global_step(),
-                        )
-
-                    self.disjoint_classifier.train()
-
-                    # apply transforms here so that they are applied both to real images and generations
-                    if self.train_transform_classifier is not None:
-                        batch = self.train_transform_classifier(batch)
-
-                    y = cond["y"]
-                    t = None
-
-                    if self.train_noised_classifier:
-                        t, _ = self.schedule_sampler.sample(
-                            batch.shape[0], dist_util.dev()
-                        )
-                        batch = self.diffusion.q_sample(batch, t)
-
-                    for i in range(0, batch.shape[0], self.microbatch):
-                        micro = batch[i : i + self.microbatch].to(dist_util.dev())
-                        micro_cond = y[i : i + self.microbatch].to(dist_util.dev())
-
-                        replays_indices = th.where(th.argmax(micro_cond, 1) < 1000)[0]
-
-                        out_classifier = self.disjoint_classifier(micro)
-                        loss = F.cross_entropy(
-                            out_classifier,
-                            micro_cond,
-                            reduction="none",
-                        )
-
-                        if (
-                            logger.get_rank_without_mpi_import() == 0
-                            and (self.step - 1) % self.log_interval == 0
-                        ):
-                            losses = {}
-                            losses[f"disjoint_classifier_loss/{self.task_id}"] = (
-                                loss.detach()
+                )
+                dist_util.sync_params(self.disjoint_classifier.parameters())
+            else:
+                with tqdm(total=self.num_steps) as pbar:
+                    epoch = 0
+                    sampling_time = 0
+                    prev_generations = None
+                    prev_generations_labels = None
+                    while self.step < self.num_steps:
+                        self.step += 1
+                        curr_epoch = self.step // self.num_batches_per_epoch
+                        # Handle lr scheduling
+                        if curr_epoch != epoch:
+                            set_annealed_lr(
+                                self.disjoint_classifier_optimizer,
+                                (
+                                    self.params.classifier_lr
+                                    if self.task_id != 0
+                                    else self.params.classifier_init_lr
+                                ),
+                                self.step / self.num_steps,
                             )
-                            losses[
-                                f"disjoint_classifier_loss_replay/{self.task_id}"
-                            ] = loss.detach()[replays_indices]
-                            losses[
-                                f"disjoint_classifier_loss_acc@1/{self.task_id}"
-                            ] = compute_top_k(
-                                out_classifier,
-                                th.argmax(micro_cond, 1),
-                                k=1,
+                            epoch = curr_epoch
+
+                        if self.task_id > 0:
+                            real_examples, real_cond = next(
+                                self.data_yielder
+                            )  # self.batch_size//(self.task_id+1)
+                            if (
+                                prev_generations is None
+                                or (self.step - 1) % self.guid_generation_interval == 0
+                            ):
+                                generated_previous_examples, generated_previous_labels = next(self.prev_yielder)
+                                prev_generations = generated_previous_examples.cpu()
+                                prev_generations_labels = (
+                                    generated_previous_labels.cpu()
+                                )
+                            else:
+                                generated_previous_examples = prev_generations
+                                generated_previous_labels = prev_generations_labels
+
+                            generated_previous_examples = ((generated_previous_examples + 1) / 2).clamp(0, 1)
+                            generated_previous_examples = self.normalize(generated_previous_examples)
+                            batch = th.cat([generated_previous_examples, real_examples])
+                            cond = {
+                                "y": th.cat(
+                                    [
+                                        generated_previous_labels,
+                                        real_cond["y"],
+                                    ]
+                                )
+                            }
+                            shuffle = th.randperm(batch.shape[0])
+                            batch = batch[shuffle]
+                            cond["y"] = cond["y"][shuffle]
+                            if (
+                                logger.get_rank_without_mpi_import() == 0
+                                and (self.step - 1) % self.log_interval == 0
+                            ):
+                                samples_grid = make_grid(
+                                    generated_previous_examples[:self.microbatch],
+                                    normalize=True,
+                                )
+                                wandb.log(
+                                    {f"generated_examples": wandb.Image(samples_grid)},
+                                    step=self.get_global_step(),
+                                )
+                        else:
+                            batch, cond = next(self.data_yielder)
+
+                        self.disjoint_classifier.train()
+
+                        # apply transforms here so that they are applied both to real images and generations
+                        if self.train_transform_classifier is not None:
+                            batch = self.train_transform_classifier(batch)
+
+                        y = cond["y"]
+                        t = None
+
+                        if self.train_noised_classifier:
+                            t, _ = self.schedule_sampler.sample(
+                                batch.shape[0], dist_util.dev()
+                            )
+                            batch = self.diffusion.q_sample(batch, t)
+
+                        for i in range(0, batch.shape[0], self.microbatch):
+                            micro = batch[i : i + self.microbatch].to(dist_util.dev())
+                            micro_cond = y[i : i + self.microbatch].to(dist_util.dev())
+
+                            replays_indices = th.where(
+                                th.argmax(micro_cond, 1)
+                                < (self.task_id) * self.classes_per_task
+                            )[0]
+
+                            out_classifier = self.disjoint_classifier(micro, t)
+                            loss = F.cross_entropy(
+                                out_classifier[:, : self.max_class + 1],
+                                micro_cond[:, : self.max_class + 1],
                                 reduction="none",
                             )
-                            losses[
-                                f"disjoint_classifier_loss_acc@5/{self.task_id}"
-                            ] = compute_top_k(
-                                out_classifier,
-                                th.argmax(micro_cond, 1),
-                                k=5,
-                                reduction="none",
-                            )
-                            wandb.log(
-                                {k: v.mean().item() for k, v in losses.items()},
-                                step=self.get_global_step(),
-                            )
-                            del losses
 
-                        if i == 0:
-                            self.disjoint_classifier_optimizer.zero_grad()
-                        loss = loss.mean() * len(micro) / len(batch)
-                        loss.backward()
+                            if (
+                                logger.get_rank_without_mpi_import() == 0
+                                and (self.step - 1) % self.log_interval == 0
+                            ):
+                                losses = {}
+                                losses[f"disjoint_classifier_loss/{self.task_id}"] = (
+                                    loss.detach()
+                                )
+                                losses[
+                                    f"disjoint_classifier_loss_replay/{self.task_id}"
+                                ] = loss.detach()[replays_indices]
+                                losses[
+                                    f"disjoint_classifier_loss_acc@1/{self.task_id}"
+                                ] = compute_top_k(
+                                    out_classifier,
+                                    th.argmax(micro_cond, 1),
+                                    k=1,
+                                    reduction="none",
+                                )
+                                losses[
+                                    f"disjoint_classifier_loss_acc@5/{self.task_id}"
+                                ] = compute_top_k(
+                                    out_classifier,
+                                    th.argmax(micro_cond, 1),
+                                    k=5,
+                                    reduction="none",
+                                )
+                                wandb.log(
+                                    {k: v.mean().item() for k, v in losses.items()},
+                                    step=self.get_global_step(),
+                                )
+                                del losses
 
-                    self.disjoint_classifier_optimizer.step()
-                    pbar.update(1)
+                            if i == 0:
+                                self.disjoint_classifier_optimizer.zero_grad()
+                            loss = loss.mean() * len(micro) / len(batch)
+                            loss.backward()
+
+                        self.disjoint_classifier_optimizer.step()
+                        pbar.update(1)
 
             if logger.get_rank_without_mpi_import() == 0:
                 wandb.log(
@@ -569,14 +498,56 @@ class TrainLoop:
                     step=self.get_global_step(),
                 )
                 print(f"sampling time: {sampling_time}")
+            self.disjoint_classifier.eval()
             checkpoint = {
                 "epoch": epoch,
                 "model": self.disjoint_classifier,
                 "optimizer": self.disjoint_classifier_optimizer,
             }
             th.save(
-                checkpoint, os.path.join(logger.get_dir(), f"disjoint_clf_final.pt")
+                checkpoint, os.path.join(logger.get_dir(), f"disjoint_clf_{self.task_id}.pt")
             )
+
+        if not self.diffusion_pretrained_dir:
+            self.ddp_model.train()
+            print("Training diffusion...")
+            with tqdm(total=self.num_steps) as pbar:
+                while (
+                    not self.lr_anneal_steps
+                    or self.step + self.resume_step < self.lr_anneal_steps
+                ) and (self.step < self.num_steps):
+                    self.step += 1
+                    pbar.update(1)
+                    if self.step > 100:
+                        self.mp_trainer.skip_gradient_thr = (
+                            self.params.skip_gradient_thr
+                        )
+                    # apply transforms here so that they are applied both to real images and generations
+                    batch, cond = next(self.data_yielder)
+                    cond["y"] = th.argmax(cond["y"], 1)  # NOTE: Map from one-hot to int
+                    if self.train_transform_diffusion is not None:
+                        batch = self.train_transform_diffusion(batch)
+                    self.run_step(batch, cond, self.step)
+                    if (
+                        (self.step - 1) % self.log_interval == 0
+                        and logger.get_rank_without_mpi_import() == 0
+                    ):
+                        wandb_safe_log(logger.getkvs(), step=self.get_global_step())
+                        logger.dumpkvs()
+                    if (not self.skip_save) & (self.step % self.save_interval == 0):
+                        self.save(self.task_id)
+                        # Run for a finite amount of time in integration tests.
+                        if (
+                            os.environ.get("DIFFUSION_TRAINING_TEST", "")
+                            and self.step > 0
+                        ):
+                            return
+                    if self.step % self.scheduler_step == 0:
+                        self.scheduler.step()
+                # Save the last checkpoint if it wasn't already saved.
+                if not self.skip_save:
+                    if self.step % self.save_interval != 0:
+                        self.save(self.task_id)
 
     def run_step(self, batch, cond, step):
         self.forward_backward(batch, cond, step)
@@ -596,7 +567,14 @@ class TrainLoop:
                 for k, v in cond.items()
             }
             last_batch = (i + self.microbatch) >= batch.shape[0]
-            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+            if isinstance(self.schedule_sampler, TaskAwareSampler):
+                t, weights = self.schedule_sampler.sample(
+                    micro.shape[0], dist_util.dev(), micro_cond["y"], self.task_id
+                )
+            else:
+                t, weights = self.schedule_sampler.sample(
+                    micro.shape[0], dist_util.dev()
+                )
 
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
@@ -712,7 +690,7 @@ class TrainLoop:
 
         # NOTE: Possible further improvements from http://arxiv.org/abs/2302.07121, but with them
         # sampling becomes very time-consuming.
-        def cond_fn(x, t, pred_xstart, y=None, low_res=None):
+        def cond_fn(x, t, pred_xstart, y=None):
             assert y is not None
             with th.enable_grad():
                 if not use_old_grad and not use_new_grad:
@@ -728,7 +706,7 @@ class TrainLoop:
                     x_out = x
 
                 if use_old_grad:
-                    logits_old = old_classifier_fn(x_in)
+                    logits_old = old_classifier_fn(x_in, t)
                     if self.trim_logits:
                         logits_old = logits_old[
                             :, : max_class - self.classes_per_task + 1
@@ -741,9 +719,9 @@ class TrainLoop:
                         norm_val = th.linalg.norm(grad_old.flatten(1), ord=th.inf)
                         grad_old = grad_old / norm_val
                     if not use_new_grad:
-                        return grad_old * self.classifier_scale_max_old
+                        return grad_old * classfier_scale_vec_old.view(-1, 1, 1, 1)
                 if use_new_grad:
-                    logits_new = new_classifier_fn(x_in)
+                    logits_new = new_classifier_fn(x_in, t)
                     if self.trim_logits:
                         logits_new = logits_new[:, : max_class + 1]
 
@@ -755,14 +733,14 @@ class TrainLoop:
                             ],
                             dim=-1,
                         )
-                        most_probable_new_task_classes = (
+                        random_new_task_classes = (
                             th.argmax(probs, dim=-1)
                             + max_class
                             + 1
                             - self.classes_per_task
                         )
                         loss_new = -F.cross_entropy(
-                            logits_new, most_probable_new_task_classes, reduction="none"
+                            logits_new, random_new_task_classes, reduction="none"
                         )
                     else:
                         loss_new = F.cross_entropy(logits_new, y, reduction="none")
@@ -771,9 +749,11 @@ class TrainLoop:
                         norm_val = th.linalg.norm(grad_new.flatten(1), ord=th.inf)
                         grad_new = grad_new / norm_val
                     if use_old_grad:
-                        return grad_old * self.classifier_scale_max_old + grad_new * self.classifier_scale_max_new
+                        return grad_old * classfier_scale_vec_old.view(
+                            -1, 1, 1, 1
+                        ) + grad_new * classfier_scale_vec_new.view(-1, 1, 1, 1)
                     else:
-                        return grad_new * self.classifier_scale_max_new
+                        return grad_new * classfier_scale_vec_new.view(-1, 1, 1, 1)
 
         with tqdm(total=total_num_examples, leave=False) as progress_bar:
             while len(all_images) * batch_size < total_num_examples:
@@ -785,19 +765,43 @@ class TrainLoop:
                 )
 
                 model_kwargs["y"] = classes
+
+                if self.disjoint_classifier is not None and use_old_grad:
+                    classfier_scale_vec_old = (
+                        th.from_numpy(
+                            np.random.uniform(
+                                low=self.classifier_scale_min_old,
+                                high=self.classifier_scale_max_old,
+                                size=(len(classes),),
+                            )
+                        )
+                        .float()
+                        .to(dist_util.dev())
+                    )
+                if self.disjoint_classifier is not None and use_new_grad:
+                    classfier_scale_vec_new = (
+                        th.from_numpy(
+                            np.random.uniform(
+                                low=self.classifier_scale_min_new,
+                                high=self.classifier_scale_max_new,
+                                size=(len(classes),),
+                            )
+                        )
+                        .float()
+                        .to(dist_util.dev())
+                    )
                 sample_fn = (
                     diffusion.ddim_sample_loop
                     if self.use_ddim
                     else diffusion.p_sample_loop
                 )
-                # Sample low res images
-                sample_low_res = sample_fn(
+                sample = sample_fn(
                     self.prev_ddp_model,
                     (
                         len(classes),
                         self.in_channels,
-                        self.image_size//4,
-                        self.image_size//4,
+                        self.image_size,
+                        self.image_size,
                     ),
                     clip_denoised=self.params.clip_denoised,
                     model_kwargs=model_kwargs,
@@ -810,23 +814,6 @@ class TrainLoop:
                             and (use_old_grad or use_new_grad)
                         )
                     ),
-                )
-
-                # Now upsample to 256x256
-                model_kwargs["low_res"] = sample_low_res
-                sample = self.sr_diffusion.p_sample_loop(
-                    self.sr_model,
-                    (
-                        len(classes),
-                        self.in_channels,
-                        self.image_size,
-                        self.image_size,
-                    ),
-                    clip_denoised=self.params.clip_denoised,
-                    model_kwargs=model_kwargs,
-                    cond_fn=None,
-                    device=dist_util.dev(),
-                    compute_grads=False,
                 )
 
                 sample = sample.detach()
@@ -894,7 +881,7 @@ class TrainLoop:
         ) = self._sample_examples(
             total_num_examples,
             batch_size,
-            1000,
+            (task_id + 1) * self.classes_per_task,
             self.diffusion,
             use_old_grad=use_old_grad,
             use_new_grad=use_new_grad,
@@ -1019,47 +1006,3 @@ def prepare_diffusion(args, timestep_respacing):
         rescale_learned_sigmas=args.rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
     )
-
-
-def calculate_accuracy(model, validation_loader, is_cub=False):
-    model.eval()  # Set the model to evaluation mode
-    correct_top1 = 0
-    correct_top5 = 0
-    total = 0
-
-    with th.no_grad():  # Disable gradient calculation
-        for inputs, labels in tqdm(validation_loader, total=len(validation_loader)):
-            inputs, labels = inputs.to(dist_util.dev()), labels.to(dist_util.dev())
-
-            outputs = model(inputs)
-            if is_cub:
-                extended_labels = th.cat(
-                    (th.zeros(labels.size(0), 1000, device=dist_util.dev()), labels),
-                    dim=1,
-                )
-            else:
-                extended_labels = th.cat(
-                    (labels, th.zeros(labels.size(0), 200, device=dist_util.dev())),
-                    dim=1,
-                )
-
-            # Convert one-hot to class indices
-            _, true_labels = th.max(extended_labels, 1)
-
-            # Top-1 accuracy
-            _, predicted_top1 = th.max(outputs.data, 1)
-            correct_top1 += (predicted_top1 == true_labels).sum().item()
-
-            # Top-5 accuracy
-            _, predicted_top5 = outputs.topk(5, 1, largest=True, sorted=True)
-            correct_top5 += (
-                th.eq(predicted_top5, true_labels.view(-1, 1).expand_as(predicted_top5))
-                .sum()
-                .item()
-            )
-
-            total += labels.size(0)
-
-    accuracy_top1 = correct_top1 / total
-    accuracy_top5 = correct_top5 / total
-    return accuracy_top1, accuracy_top5

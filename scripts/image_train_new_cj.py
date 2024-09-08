@@ -13,6 +13,7 @@ from collections import OrderedDict
 
 import numpy as np
 import torch as th
+from dataloaders.utils import yielder
 
 import wandb
 from cl_methods.utils import get_cl_method
@@ -35,7 +36,7 @@ from guide.script_util import (
     model_and_diffusion_defaults,
     results_to_log,
 )
-from guide.train_util import TrainLoop
+from guide.train_util_new_cj import TrainLoop
 from guide.validation import calculate_accuracy_with_classifier
 
 # os.environ["WANDB_MODE"] = "disabled"
@@ -83,21 +84,12 @@ def run_training_with_args(args):
         train_aug=args.train_aug,
         skip_normalization=args.skip_normalization,
         classifier_augmentation=args.classifier_augmentation,
+        standard_norm_stats=args.standard_norm_stats,
     )
 
     args.image_size = image_size
     args.in_channels = image_channels
     args.model_num_classes = n_classes
-
-    logger.log("creating model and diffusion...")
-    model, diffusion = create_model_and_diffusion(
-        **args_to_dict(args, model_and_diffusion_defaults().keys())
-    )
-    if args.log_gradient_stats and not os.environ.get("WANDB_MODE") == "disabled":
-        wandb.watch(model, log_freq=10)
-    # if we are not training diffusion, we will not need this model
-    if not args.train_with_disjoint_classifier:
-        model.to(dist_util.dev())
 
     classifier = None
     if args.train_with_disjoint_classifier:
@@ -124,10 +116,6 @@ def run_training_with_args(args):
             logger.log(
                 f"loading classifier from {args.resume_checkpoint_classifier}..."
             )
-
-    schedule_sampler = create_named_schedule_sampler(
-        args.schedule_sampler, diffusion, args
-    )
 
     logger.log("creating data loaders...")
     train_dataset_splits, _, classes_per_task = data_split(
@@ -191,18 +179,43 @@ def run_training_with_args(args):
             if not args.train_with_disjoint_classifier:
                 num_steps = args.first_task_num_steps
             else:
-                num_steps = args.disjoint_classifier_init_num_steps
+                if args.num_epochs is not None:
+                    num_steps = len(train_dataset_splits[task_id]) // (args.batch_size // (task_id + 1))
+                else:
+                    num_steps = args.disjoint_classifier_init_num_steps
         else:
             if not args.train_with_disjoint_classifier:
                 num_steps = args.num_steps
             else:
-                num_steps = args.disjoint_classifier_num_steps
+                if args.num_epochs is not None:
+                    num_steps = len(train_dataset_splits[task_id]) // (args.batch_size // (task_id + 1))
+                else:
+                    num_steps = args.disjoint_classifier_num_steps
+        print(f"num_steps: {num_steps}")
+
+        prev_dataset = None
+        prev_yielder = None
+        for i in range(task_id):
+            if prev_dataset is None:
+                prev_dataset = train_dataset_splits[i]
+            else:
+                prev_dataset += train_dataset_splits[i]
+        if prev_dataset is not None:
+            prev_loader = th.utils.data.DataLoader(
+                dataset=prev_dataset,
+                batch_size=(self.args.batch_size // (task_id + 1)) * task_id,
+                shuffle=True,
+                drop_last=True,
+                generator=generator,
+            )
+            prev_yielder = yielder(prev_loader)
+
 
         train_loop = TrainLoop(
             params=args,
-            model=model,
-            prev_model=copy.deepcopy(model).to(dist_util.dev()),
-            diffusion=diffusion,
+            model=None,
+            prev_model=None,
+            diffusion=None,
             task_id=task_id,
             data=train_dataset_splits[task_id],
             data_yielder=None,
@@ -220,7 +233,7 @@ def run_training_with_args(args):
             ),
             use_fp16=args.use_fp16,
             fp16_scale_growth=args.fp16_scale_growth,
-            schedule_sampler=schedule_sampler,
+            schedule_sampler=None,
             weight_decay=args.weight_decay,
             lr_anneal_steps=args.lr_anneal_steps,
             num_steps=num_steps,
@@ -251,6 +264,7 @@ def run_training_with_args(args):
             train_noised_classifier=args.train_noised_classifier,
             mean_norm=mean_norm,
             std_norm=std_norm,
+            prev_yielder=prev_yielder,
         )
 
         if task_id >= args.first_task:
