@@ -169,7 +169,7 @@ def run_training_with_args(args):
     train_loop = None
     cl_method = get_cl_method(args)
     global_step = 0
-    num_steps = len(train_dataset_cub) // args.batch_size
+    num_steps = len(train_dataset_cub) // (args.batch_size * dist.get_world_size())
     print(f"num_steps: {num_steps}")
 
     train_loop = TrainLoop(
