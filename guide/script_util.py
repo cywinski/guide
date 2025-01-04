@@ -39,12 +39,10 @@ def create_model_and_diffusion(
     use_fp16,
     use_new_attention_order,
     model_name,
-    model_switching_timestep,
     embedding_kind,
     model_num_classes=None,
     noise_marg_reg=False,
     train_noised_classifier=False,
-    classifier_augmentation=True,
 ):
     model = create_model(
         image_size,
@@ -52,7 +50,6 @@ def create_model_and_diffusion(
         num_channels,
         num_res_blocks,
         model_name=model_name,
-        model_switching_timestep=model_switching_timestep,
         embedding_kind=embedding_kind,
         channel_mult=channel_mult,
         learn_sigma=learn_sigma,
@@ -67,7 +64,6 @@ def create_model_and_diffusion(
         use_fp16=use_fp16,
         use_new_attention_order=use_new_attention_order,
         num_classes=model_num_classes,
-        classifier_augmentation=classifier_augmentation,
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
@@ -92,7 +88,6 @@ def create_model(
     num_channels,
     num_res_blocks,
     model_name,
-    model_switching_timestep,
     embedding_kind,
     channel_mult="",
     learn_sigma=False,
@@ -107,7 +102,6 @@ def create_model(
     use_fp16=False,
     use_new_attention_order=False,
     num_classes=None,
-    classifier_augmentation=False,
 ):
     if channel_mult == "":
         if image_size == 512:
@@ -158,9 +152,7 @@ def create_model(
         use_scale_shift_norm=use_scale_shift_norm,
         resblock_updown=resblock_updown,
         use_new_attention_order=use_new_attention_order,
-        model_switching_timestep=model_switching_timestep,
         embedding_kind=embedding_kind,
-        classifier_augmentation=classifier_augmentation,
     )
 
 

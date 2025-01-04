@@ -12,5 +12,6 @@ setup(
         "wandb==0.16.5",
         "matplotlib==3.7.5",
         "pytz==2024.1",
-    ],
+        "torchvision"
+    ][],
 )

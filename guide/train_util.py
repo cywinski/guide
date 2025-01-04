@@ -57,8 +57,6 @@ class TrainLoop:
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        scheduler_rate=1,
-        scheduler_step=1000,
         num_steps=10000,
         image_size=32,
         in_channels=3,
@@ -170,10 +168,6 @@ class TrainLoop:
             self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
         )
 
-        self.scheduler = th.optim.lr_scheduler.ExponentialLR(
-            self.opt, gamma=scheduler_rate
-        )
-        self.scheduler_step = scheduler_step
         self.classifier_first_task_dir = classifier_first_task_dir
 
         if self.disjoint_classifier is not None:
@@ -559,10 +553,6 @@ class TrainLoop:
                 ) and (self.step < self.num_steps):
                     self.step += 1
                     pbar.update(1)
-                    if self.step > 100:
-                        self.mp_trainer.skip_gradient_thr = (
-                            self.params.skip_gradient_thr
-                        )
                     # apply transforms here so that they are applied both to real images and generations
                     batch, cond = next(self.data_yielder)
                     cond["y"] = th.argmax(cond["y"], 1)  # NOTE: Map from one-hot to int
@@ -583,8 +573,6 @@ class TrainLoop:
                             and self.step > 0
                         ):
                             return
-                    if self.step % self.scheduler_step == 0:
-                        self.scheduler.step()
                 # Save the last checkpoint if it wasn't already saved.
                 if not self.skip_save:
                     if self.step % self.save_interval != 0:
@@ -602,7 +590,6 @@ class TrainLoop:
         self.mp_trainer.zero_grad()
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
-            # micro_cond = cond[i: i + self.microbatch].to(dist_util.dev())  # {
             micro_cond = {
                 k: v[i : i + self.microbatch].to(dist_util.dev())
                 for k, v in cond.items()

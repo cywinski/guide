@@ -63,7 +63,6 @@ def model_and_diffusion_defaults():
         use_new_attention_order=False,
         image_size=32,
         in_channels=3,
-        model_switching_timestep=30,
         model_name="UNetModel",
         embedding_kind="concat_time_1hot",  # embedding used for time and "class", possible values in EMBEDDING_KINDS
         model_num_classes=None,
@@ -111,7 +110,6 @@ def all_training_defaults():
         train_aug=False,
         skip_normalization=False,
         num_steps=20000,
-        scheduler_rate=1.0,
         first_task_num_classes=0,
         first_task_num_steps=-1,  # if -1, set to the same as num_steps.
         skip_gradient_thr=-1,

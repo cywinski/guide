@@ -28,23 +28,41 @@ SETUP_RETRY_COUNT = 3
 
 def setup_dist(args):
     """
-    Setup a distributed process group.
+    Setup a distributed process group for multi-GPU training with MPI.
+    This function assigns each process to a specific GPU based on the MPI rank
+    and the logical GPU indices exposed by CUDA_VISIBLE_DEVICES.
     """
-    # global GPU_ID
-    # if args.gpu_id == -1:
-    #     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-    #     GPU_ID = ""
-    # elif args.gpu_id != -2:
-    #     # GPU_ID = f":{args.gpu_id}"
-    #     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
-
     if dist.is_initialized():
         return
-    os.environ["CUDA_VISIBLE_DEVICES"] = f"{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}"
-    print("visible devices:", os.environ["CUDA_VISIBLE_DEVICES"])
+
+    # Retrieve the number of visible GPUs from CUDA_VISIBLE_DEVICES
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not cuda_visible_devices:
+        raise ValueError("CUDA_VISIBLE_DEVICES is not set. Please specify GPU devices.")
+
+    # Parse the visible devices as logical indices
+    gpu_count = len(cuda_visible_devices.split(","))
+
+    # Ensure rank does not exceed available GPUs
+    rank = MPI.COMM_WORLD.Get_rank()
+    if rank >= gpu_count:
+        raise RuntimeError(
+            f"Process rank {rank} exceeds the number of available logical GPUs {gpu_count} "
+            f"from CUDA_VISIBLE_DEVICES={cuda_visible_devices}"
+        )
+
+    # Map the rank to a logical GPU index
+    gpu_id = rank  # Since CUDA_VISIBLE_DEVICES remaps GPUs to logical indices
+    th.cuda.set_device(gpu_id)  # Use logical index directly
+    print(
+        f"Process {rank} is using logical GPU {gpu_id} (from CUDA_VISIBLE_DEVICES={cuda_visible_devices})"
+    )
+
+    # Initialize the communication backend
     comm = MPI.COMM_WORLD
     backend = "gloo" if not th.cuda.is_available() else "nccl"
 
+    # Set hostname for distributed communication
     if backend == "gloo":
         hostname = "localhost"
     else:
@@ -52,11 +70,22 @@ def setup_dist(args):
     os.environ["MASTER_ADDR"] = comm.bcast(hostname, root=0)
     os.environ["RANK"] = str(comm.rank)
     os.environ["WORLD_SIZE"] = str(comm.size)
-    print("world size:", os.environ["WORLD_SIZE"])
+    print("World size:", os.environ["WORLD_SIZE"])
 
+    # Broadcast the free port from the root process
     port = comm.bcast(_find_free_port(), root=0)
     os.environ["MASTER_PORT"] = str(port)
+
+    # Initialize the distributed process group
     dist.init_process_group(backend=backend, init_method="env://")
+
+
+def _find_free_port():
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
 
 
 def dev():

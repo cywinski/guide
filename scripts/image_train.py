@@ -91,6 +91,8 @@ def run_training_with_args(args):
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.log(f"total parameters: {total_params:,}")
     if args.log_gradient_stats and not os.environ.get("WANDB_MODE") == "disabled":
         wandb.watch(model, log_freq=10)
     # if we are not training diffusion, we will not need this model
@@ -208,7 +210,6 @@ def run_training_with_args(args):
             batch_size=args.batch_size,
             microbatch=args.microbatch,
             lr=args.lr,
-            scheduler_rate=args.scheduler_rate,
             ema_rate=args.ema_rate,
             log_interval=args.log_interval,
             skip_save=args.skip_save,
