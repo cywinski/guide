@@ -10,18 +10,15 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
 from tqdm import tqdm
 
 import wandb
-from dataloaders.utils import yielder
-from dataloaders.wrapper import AppendName
 
 from . import dist_util, logger
 from .fp16_util import MixedPrecisionTrainer
 from .logger import wandb_safe_log
 from .nn import update_ema
-from .resample import LossAwareSampler, TaskAwareSampler, UniformSampler
+from .resample import LossAwareSampler, UniformSampler
 
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
@@ -544,13 +541,14 @@ class TrainLoop:
             )
 
         if not self.diffusion_pretrained_dir:
-            self.ddp_model.train()
             print("Training diffusion...")
             with tqdm(total=self.num_steps) as pbar:
                 while (
                     not self.lr_anneal_steps
                     or self.step + self.resume_step < self.lr_anneal_steps
                 ) and (self.step < self.num_steps):
+                    self.ddp_model.train()
+                    self.model.train()
                     self.step += 1
                     pbar.update(1)
                     # apply transforms here so that they are applied both to real images and generations
@@ -567,6 +565,32 @@ class TrainLoop:
                         logger.dumpkvs()
                     if (not self.skip_save) & (self.step % self.save_interval == 0):
                         self.save(self.task_id)
+                        self.model.eval()
+                        (
+                            generated_previous_examples,
+                            generated_previous_examples_labels,
+                            generated_previous_examples_confidences,
+                        ) = self.generate_examples(
+                            self.task_id,
+                            self.params.n_examples_to_log,
+                            batch_size=-1,
+                            equal_n_examples_per_class=True,
+                            use_old_grad=False,
+                            use_new_grad=False,
+                            model_to_use=self.model,
+                        )
+                        logger.log(
+                            f"generated {len(generated_previous_examples)} examples"
+                        )
+                        if logger.get_rank_without_mpi_import() == 0:
+                            wandb.log(
+                                {
+                                    f"sample_images/{self.task_id}": wandb.Image(
+                                        generated_previous_examples
+                                    )
+                                },
+                                step=self.get_global_step(),
+                            )
                         # Run for a finite amount of time in integration tests.
                         if (
                             os.environ.get("DIFFUSION_TRAINING_TEST", "")
@@ -585,6 +609,7 @@ class TrainLoop:
             self._update_ema()
         self._anneal_lr()
         self.log_step()
+        self.log_lr()
 
     def forward_backward(self, batch, cond, step):
         self.mp_trainer.zero_grad()
@@ -595,31 +620,21 @@ class TrainLoop:
                 for k, v in cond.items()
             }
             last_batch = (i + self.microbatch) >= batch.shape[0]
-            if isinstance(self.schedule_sampler, TaskAwareSampler):
-                t, weights = self.schedule_sampler.sample(
-                    micro.shape[0], dist_util.dev(), micro_cond["y"], self.task_id
-                )
-            else:
-                t, weights = self.schedule_sampler.sample(
-                    micro.shape[0], dist_util.dev()
-                )
+            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
 
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
                 self.ddp_model,
                 micro,
                 t,
-                self.task_id,
                 model_kwargs=micro_cond,
-                step=step,
-                max_class=self.max_class + 1,
             )
 
             if last_batch or not self.use_ddp:
-                losses, aux_info = compute_losses()
+                losses = compute_losses()
             else:
                 with self.ddp_model.no_sync():
-                    losses, aux_info = compute_losses()
+                    losses = compute_losses()
 
             if isinstance(self.schedule_sampler, LossAwareSampler):
                 self.schedule_sampler.update_with_local_losses(
@@ -663,6 +678,9 @@ class TrainLoop:
             "samples_cur_task", (self.step + self.resume_step) * self.global_batch
         )
 
+    def log_lr(self):
+        logger.logkv("lr", self.opt.param_groups[0]["lr"])
+
     def save(self, task_id):
         def save_checkpoint(rate, params):
             state_dict = self.mp_trainer.master_params_to_state_dict(params)
@@ -704,6 +722,7 @@ class TrainLoop:
         max_class=None,
         real_examples=None,
         norm=False,
+        model_to_use=None,
     ):
         all_images = []
         all_labels = []
@@ -824,7 +843,7 @@ class TrainLoop:
                     else diffusion.p_sample_loop
                 )
                 sample = sample_fn(
-                    self.prev_ddp_model,
+                    self.prev_ddp_model if model_to_use is None else model_to_use,
                     (
                         len(classes),
                         self.in_channels,
@@ -893,6 +912,7 @@ class TrainLoop:
         trim_logits=False,
         max_class=None,
         real_examples=None,
+        model_to_use=None,
     ):
         if not only_one_task:
             total_num_examples = n_examples_per_task * (task_id + 1)
@@ -916,28 +936,13 @@ class TrainLoop:
             trim_logits=trim_logits,
             max_class=max_class,
             real_examples=real_examples,
+            model_to_use=model_to_use,
         )
 
         return all_images, all_labels, None
 
     def get_global_step(self):
         return self.global_steps_before + self.step
-
-    def append_generated_data(self, new_examples, new_labels):
-        generated_dataset = AppendName(
-            TensorDataset(new_examples, new_labels),
-            new_labels.cpu().numpy(),
-            True,
-            False,
-        )
-        joined_dataset = ConcatDataset([self.data, generated_dataset])
-        train_dataset_loader = DataLoader(
-            dataset=joined_dataset,
-            batch_size=(self.params.batch_size // int(os.environ["WORLD_SIZE"])),
-            shuffle=True,
-            drop_last=True,
-        )
-        self.data_yielder = yielder(train_dataset_loader)
 
 
 def parse_resume_step_from_filename(filename):

@@ -4,10 +4,8 @@ import numpy as np
 import torch as th
 import torch.distributed as dist
 
-import wandb
 
-
-def create_named_schedule_sampler(name, diffusion, args):
+def create_named_schedule_sampler(name, diffusion):
     """
     Create a ScheduleSampler from a library of pre-defined samplers.
 
@@ -16,12 +14,8 @@ def create_named_schedule_sampler(name, diffusion, args):
     """
     if name == "uniform":
         return UniformSampler(diffusion)
-    elif name == "beta":
-        return BetaSampler(diffusion, args.alpha, args.beta)
     elif name == "loss-second-moment":
         return LossSecondMomentResampler(diffusion)
-    elif name == "task_aware":
-        return TaskAwareSampler(diffusion, args.alpha, args.beta)
     else:
         raise NotImplementedError(f"unknown schedule sampler: {name}")
 
@@ -56,7 +50,6 @@ class ScheduleSampler(ABC):
                  - weights: a tensor of weights to scale the resulting losses.
         """
         w = self.weights()
-        # wandb.log({f"w_{i}":w[i] for i in range(len(w))})
         p = w / np.sum(w)
         indices_np = np.random.choice(len(p), size=(batch_size,), p=p)
         indices = th.from_numpy(indices_np).long().to(device)
@@ -69,47 +62,6 @@ class UniformSampler(ScheduleSampler):
     def __init__(self, diffusion):
         self.diffusion = diffusion
         self._weights = np.ones([diffusion.num_timesteps])
-
-    def weights(self):
-        return self._weights
-
-
-class TaskAwareSampler:
-    def __init__(self, diffusion, alfa=4, beta=1.2):
-        self.diffusion = diffusion
-        self.beta_sampler = BetaSampler(diffusion, alfa, beta, weights_smoothing=0)
-        self.uniform_sampler = UniformSampler(diffusion)
-
-    def sample(self, batch_size, device, task_ids, current_task_id):
-        curr_task_indices, curr_task_weights = self.uniform_sampler.sample(
-            (task_ids == current_task_id).sum().item(), device
-        )
-        prev_task_indices, prev_task_weights = self.beta_sampler.sample(
-            (task_ids != current_task_id).sum().item(), device
-        )
-        indices = th.zeros(batch_size, device=device).long()
-        weights = th.zeros(batch_size, device=device).float()
-
-        indices[task_ids == current_task_id] = curr_task_indices
-        indices[task_ids != current_task_id] = prev_task_indices
-
-        weights[task_ids == current_task_id] = curr_task_weights
-        weights[task_ids != current_task_id] = prev_task_weights
-        return indices, weights
-
-
-class BetaSampler(ScheduleSampler):
-    def __init__(self, diffusion, alfa=4, beta=1.2, weights_smoothing=1):
-        beta_dist = th.distributions.beta.Beta(alfa, beta)
-        w = th.exp(
-            beta_dist.log_prob(
-                (th.arange(0, diffusion.num_timesteps) / diffusion.num_timesteps)
-            )
-        )
-        self.diffusion = diffusion
-        self._weights = (
-            w.numpy() + weights_smoothing
-        )  # np.ones([diffusion.num_timesteps])
 
     def weights(self):
         return self._weights

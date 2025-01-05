@@ -1,5 +1,5 @@
 """
-This code started out as a Pyth port of Ho et al's diffusion models:
+This code started out as a PyTorch port of Ho et al's diffusion models:
 https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/diffusion_utils_2.py
 
 Docstrings have been added, as well as DDIM sampling and a new collection of beta schedules.
@@ -11,14 +11,11 @@ import math
 import numpy as np
 import torch as th
 
-from guide import dist_util
-
 from .losses import discretized_gaussian_log_likelihood, normal_kl
 from .nn import mean_flat
-from .resample import TaskAwareSampler
 
 
-def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
+def get_named_beta_schedule_legacy(schedule_name, num_diffusion_timesteps):
     """
     Get a pre-defined beta schedule for the given name.
 
@@ -46,11 +43,33 @@ def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
             num_diffusion_timesteps,
             lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2,
         )
-    elif schedule_name == "sigmoid":
-        start = 1e-5
-        end = 1e-2
-        betas = th.linspace(-6, 6, num_diffusion_timesteps)
-        return th.sigmoid(betas) * (end - start) + start
+    else:
+        raise NotImplementedError(f"unknown beta schedule: {schedule_name}")
+
+
+def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
+    """
+    Get a pre-defined beta schedule for the given name.
+
+    The beta schedule library consists of beta schedules which remain similar
+    in the limit of num_diffusion_timesteps.
+    Beta schedules may be added, but should not be removed or changed once
+    they are committed to maintain backwards compatibility.
+    """
+    if schedule_name == "linear":
+        # Linear schedule from Ho et al, extended to work for any number of
+        # diffusion steps.
+        scale = 1000 / num_diffusion_timesteps
+        beta_start = scale * 0.0001
+        beta_end = scale * 0.02
+        return np.linspace(
+            beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64
+        )
+    elif schedule_name == "cosine":
+        return betas_for_alpha_bar(
+            num_diffusion_timesteps,
+            lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2,
+        )
     else:
         raise NotImplementedError(f"unknown beta schedule: {schedule_name}")
 
@@ -136,14 +155,11 @@ class GaussianDiffusion:
         model_var_type,
         loss_type,
         rescale_timesteps=False,
-        noise_marg_reg=False,
-        train_noised_classifier=False,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
         self.rescale_timesteps = rescale_timesteps
-        self.noise_marg_reg = noise_marg_reg
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -183,10 +199,6 @@ class GaussianDiffusion:
             * np.sqrt(alphas)
             / (1.0 - self.alphas_cumprod)
         )
-
-        self.calculate_nll = False
-        self.train_noised_classifier = train_noised_classifier
-        self.classifier_loss = th.nn.CrossEntropyLoss(reduction="none")
 
     def q_mean_variance(self, x_start, t):
         """
@@ -277,11 +289,7 @@ class GaussianDiffusion:
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
-        if model_kwargs.get("return_res_out", False):
-            model_output, res_out = model(x, self._scale_timesteps(t), **model_kwargs)
-        else:
-            model_output = model(x, self._scale_timesteps(t), **model_kwargs)
-            res_out = None
+        model_output = model(x, self._scale_timesteps(t), **model_kwargs)
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
@@ -347,8 +355,6 @@ class GaussianDiffusion:
             "variance": model_variance,
             "log_variance": model_log_variance,
             "pred_xstart": pred_xstart,
-            "res_out": res_out,
-            "raw_out": model_output,
         }
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
@@ -564,13 +570,6 @@ class GaussianDiffusion:
 
             indices = tqdm(indices)
 
-        if limit_indices is not None and (limit_indices > 1):
-            if not reverse:
-                indices = indices[: -(limit_indices - 1)]
-                indices[-1] = 0
-            else:
-                indices = indices[-limit_indices:]
-
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
             with th.set_grad_enabled(compute_grads):
@@ -754,13 +753,6 @@ class GaussianDiffusion:
 
             indices = tqdm(indices)
 
-        if limit_indices is not None and (limit_indices > 1):
-            if not reverse:
-                indices = indices[: -(limit_indices - 1)]
-                indices[-1] = 0
-            else:
-                indices = indices[-limit_indices:]
-
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
             with th.set_grad_enabled(compute_grads):
@@ -778,14 +770,7 @@ class GaussianDiffusion:
                 img = out["sample"]
 
     def _vb_terms_bpd(
-        self,
-        model,
-        x_start,
-        x_t,
-        t,
-        clip_denoised=True,
-        model_kwargs=None,
-        res_model_loss=False,
+        self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None
     ):
         """
         Get a term for the variational lower-bound.
@@ -800,8 +785,6 @@ class GaussianDiffusion:
         true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(
             x_start=x_start, x_t=x_t, t=t
         )
-        if res_model_loss:
-            model_kwargs["return_res_out"] = True
         out = self.p_mean_variance(
             model, x_t, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs
         )
@@ -821,149 +804,7 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def partial_sample_loop(
-        self,
-        current_model,
-        prev_model,
-        schedule_sampler,
-        task_id,
-        n_examples_per_task,
-        shape,
-        denoised_fn=None,
-        clip_denoised=True,
-        cond_fn=None,
-        batch_size=-1,
-    ):
-        device = dist_util.dev()
-        total_num_exapmles = n_examples_per_task * (task_id)
-        tasks = th.tensor(
-            (list(range(task_id)) * (n_examples_per_task)), device=device
-        ).sort()[0]
-        if isinstance(schedule_sampler, TaskAwareSampler):
-            timesteps, _ = schedule_sampler.sample(
-                total_num_exapmles, device, tasks, task_id
-            )
-        else:
-            timesteps, _ = schedule_sampler.sample(total_num_exapmles, device)
-        min_timestep_clip = self.num_timesteps * 2.5 // 4
-        timesteps[timesteps < min_timestep_clip] = min_timestep_clip
-
-        if batch_size == -1:
-            batch_size = total_num_exapmles
-        prev_model.eval()
-        all_images_pre_mean = []
-        all_images_pre_variance = []
-        all_images_mean = []
-        all_images_variance = []
-        model_kwargs = {}
-        j = 0
-
-        while len(all_images_mean) < total_num_exapmles:
-            num_examples_to_generate = min(
-                batch_size, total_num_exapmles - len(all_images_mean)
-            )
-            shape[0] = num_examples_to_generate
-            model_kwargs["y"] = tasks[
-                j * batch_size : j * batch_size + num_examples_to_generate
-            ]
-            selected_timesteps = timesteps[
-                j * batch_size : j * batch_size + num_examples_to_generate
-            ]
-            img = th.randn(*shape, device=device)
-            # t = th.tensor([0] * shape[0], device=device)
-            indices = list(range(selected_timesteps.min(), self.num_timesteps))[::-1]
-            out_img = th.zeros_like(img)
-            for i in indices:
-                t = th.tensor([i] * shape[0], device=device)
-                with th.no_grad():
-                    out = self.p_sample(
-                        prev_model,
-                        img,
-                        t,
-                        clip_denoised=clip_denoised,
-                        denoised_fn=denoised_fn,
-                        cond_fn=cond_fn,
-                        model_kwargs=model_kwargs,
-                    )
-                    img = out["sample"]
-                    ready_out_images = selected_timesteps == t
-                    out_img[ready_out_images] = img[ready_out_images]
-            with th.no_grad():
-                out_prev = self.p_mean_variance(
-                    prev_model,
-                    out_img,
-                    selected_timesteps,
-                    clip_denoised=clip_denoised,
-                    model_kwargs=model_kwargs,
-                )
-            all_images_pre_mean.extend(out_prev["mean"])
-            all_images_pre_variance.extend(out_prev["log_variance"])
-            out_curr = self.p_mean_variance(
-                current_model,
-                out_img,
-                selected_timesteps,
-                clip_denoised=clip_denoised,
-                model_kwargs=model_kwargs,
-            )
-            all_images_mean.extend(out_curr["mean"])
-            all_images_variance.extend(out_curr["log_variance"])
-            j += 1
-
-        return (
-            th.stack(all_images_mean, 0),
-            th.stack(all_images_variance, 0),
-            th.stack(all_images_pre_mean, 0),
-            th.stack(all_images_pre_variance, 0),
-        )
-
-    def calculate_loss_previous_task(
-        self,
-        current_model,
-        prev_model,
-        schedule_sampler,
-        task_id,
-        n_examples_per_task,
-        shape,
-        denoised_fn=None,
-        clip_denoised=True,
-        cond_fn=None,
-        batch_size=-1,
-    ):
-        (
-            imgs_curr_mean,
-            imgs_curr_variance,
-            imgs_prev_mean,
-            imgs_prev_variance,
-        ) = self.partial_sample_loop(
-            current_model,
-            prev_model,
-            schedule_sampler,
-            task_id,
-            n_examples_per_task,
-            shape,
-            denoised_fn,
-            clip_denoised,
-            cond_fn,
-            batch_size=batch_size,
-        )
-        kl = normal_kl(
-            imgs_prev_mean, imgs_prev_variance, imgs_curr_mean, imgs_curr_variance
-        )
-        kl = mean_flat(kl) / np.log(2.0)
-
-        return kl.sum()
-
-    def training_losses(
-        self,
-        model,
-        x_start,
-        t,
-        task_id,
-        model_kwargs=None,
-        noise=None,
-        step=0,
-        max_class=0,
-    ):
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
 
@@ -996,15 +837,12 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            out = self.p_mean_variance(
-                model, x_t, t, clip_denoised=False, model_kwargs=model_kwargs
-            )
+            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
                 ModelVarType.LEARNED_RANGE,
             ]:
-                model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
                 B, C = x_t.shape[:2]
                 assert model_output.shape == (B, C * 2, *x_t.shape[2:])
                 model_output, model_var_values = th.split(model_output, C, dim=1)
@@ -1023,8 +861,6 @@ class GaussianDiffusion:
                     # Without a factor of 1/1000, the VB term hurts the MSE term.
                     terms["vb"] *= self.num_timesteps / 1000.0
 
-            model_output = out["raw_out"]
-
             target = {
                 ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
                     x_start=x_start, x_t=x_t, t=t
@@ -1038,17 +874,10 @@ class GaussianDiffusion:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:
                 terms["loss"] = terms["mse"]
-
         else:
             raise NotImplementedError(self.loss_type)
 
-        #  Share info that could be used externally by CL methods.
-        aux_info = {
-            "x_t": x_t,
-            "t_scaled": self._scale_timesteps(t),
-        }
-
-        return terms, aux_info
+        return terms
 
     def _prior_bpd(self, x_start):
         """
@@ -1068,9 +897,7 @@ class GaussianDiffusion:
         )
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def calc_bpd_loop(
-        self, model, x_start, clip_denoised=True, model_kwargs=None, skip_last=False
-    ):
+    def calc_bpd_loop(self, model, x_start, clip_denoised=True, model_kwargs=None):
         """
         Compute the entire variational lower-bound, measured in bits-per-dim,
         as well as other related quantities.
@@ -1094,11 +921,7 @@ class GaussianDiffusion:
         vb = []
         xstart_mse = []
         mse = []
-        if skip_last:
-            indices = list(range(self.num_timesteps))[::-1][:-1]
-        else:
-            indices = list(range(self.num_timesteps))[::-1]
-        for t in indices:
+        for t in list(range(self.num_timesteps))[::-1]:
             t_batch = th.tensor([t] * batch_size, device=device)
             noise = th.randn_like(x_start)
             x_t = self.q_sample(x_start=x_start, t=t_batch, noise=noise)

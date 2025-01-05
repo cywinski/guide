@@ -64,7 +64,7 @@ def model_and_diffusion_defaults():
         image_size=32,
         in_channels=3,
         model_name="UNetModel",
-        embedding_kind="concat_time_1hot",  # embedding used for time and "class", possible values in EMBEDDING_KINDS
+        embedding_kind="add_time_learned",  # embedding used for time and "class", possible values in EMBEDDING_KINDS
         model_num_classes=None,
         train_noised_classifier=False,
     )
@@ -85,7 +85,7 @@ def all_training_defaults():
         schedule_sampler="uniform",
         alpha=4,
         beta=1.2,
-        lr=2e-4,
+        lr=1e-4,
         disjoint_classifier_lr=1e-2,
         weight_decay=0.0,
         lr_anneal_steps=0,
@@ -95,6 +95,7 @@ def all_training_defaults():
         log_interval=500,
         skip_save=False,
         save_interval=5000,
+        n_examples_to_log=16,
         guid_generation_interval=1,  # generate new examples from diffusion model every guid_generation_interval steps
         resume_checkpoint="",
         resume_checkpoint_classifier="",

@@ -126,7 +126,7 @@ def run_training_with_args(args):
             )
 
     schedule_sampler = create_named_schedule_sampler(
-        args.schedule_sampler, diffusion, args
+        args.schedule_sampler, diffusion
     )
 
     logger.log("creating data loaders...")

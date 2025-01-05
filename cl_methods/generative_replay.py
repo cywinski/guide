@@ -4,7 +4,6 @@ from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
 from cl_methods.base import CLMethod
 from dataloaders.utils import yielder
 from dataloaders.wrapper import AppendName
-from guide import dist_util
 from guide.logger import get_rank_without_mpi_import, log_generated_examples
 
 
@@ -23,7 +22,6 @@ class GenerativeReplay(CLMethod):
                 batch_size=self.args.batch_size,
                 shuffle=True,
                 drop_last=True,
-                generator=generator,
             )
             dataset_yielder = yielder(train_dataset_loader)
         else:
@@ -58,7 +56,6 @@ class GenerativeReplay(CLMethod):
                 batch_size=self.args.batch_size,
                 shuffle=True,
                 drop_last=True,
-                generator=generator,
             )
             dataset_yielder = yielder(train_dataset_loader)
             if get_rank_without_mpi_import() == 0:
