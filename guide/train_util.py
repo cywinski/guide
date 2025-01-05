@@ -546,7 +546,7 @@ class TrainLoop:
                 while (
                     not self.lr_anneal_steps
                     or self.step + self.resume_step < self.lr_anneal_steps
-                ) and (self.step < self.num_steps):
+                ):
                     self.ddp_model.train()
                     self.model.train()
                     self.step += 1

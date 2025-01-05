@@ -189,14 +189,14 @@ def run_training_with_args(args):
 
         if task_id == 0:
             if not args.train_with_disjoint_classifier:
-                num_steps = args.first_task_num_steps
+                lr_anneal_steps = args.first_task_num_steps
             else:
-                num_steps = args.disjoint_classifier_init_num_steps
+                lr_anneal_steps = args.disjoint_classifier_init_num_steps
         else:
             if not args.train_with_disjoint_classifier:
-                num_steps = args.num_steps
+                lr_anneal_steps = args.num_steps
             else:
-                num_steps = args.disjoint_classifier_num_steps
+                lr_anneal_steps = args.disjoint_classifier_num_steps
 
         train_loop = TrainLoop(
             params=args,
@@ -221,8 +221,8 @@ def run_training_with_args(args):
             fp16_scale_growth=args.fp16_scale_growth,
             schedule_sampler=schedule_sampler,
             weight_decay=args.weight_decay,
-            lr_anneal_steps=args.lr_anneal_steps,
-            num_steps=num_steps,
+            lr_anneal_steps=lr_anneal_steps,
+            num_steps=lr_anneal_steps,
             image_size=args.image_size,
             in_channels=args.in_channels,
             max_class=max_class,
