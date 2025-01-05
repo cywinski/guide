@@ -193,6 +193,7 @@ class TrainLoop:
             self.ema_params = [
                 self._load_ema_parameters(rate) for rate in self.ema_rate
             ]
+            self.resume_step = 0  # resuming only as starting point to the next task
         else:
             self.ema_params = [
                 copy.deepcopy(self.mp_trainer.master_params)
@@ -549,8 +550,6 @@ class TrainLoop:
                 ):
                     self.ddp_model.train()
                     self.model.train()
-                    self.step += 1
-                    pbar.update(1)
                     # apply transforms here so that they are applied both to real images and generations
                     batch, cond = next(self.data_yielder)
                     cond["y"] = th.argmax(cond["y"], 1)  # NOTE: Map from one-hot to int
@@ -558,7 +557,7 @@ class TrainLoop:
                         batch = self.train_transform_diffusion(batch)
                     self.run_step(batch, cond, self.step)
                     if (
-                        (self.step - 1) % self.log_interval == 0
+                        self.step % self.log_interval == 0
                         and logger.get_rank_without_mpi_import() == 0
                     ):
                         wandb_safe_log(logger.getkvs(), step=self.get_global_step())
@@ -597,9 +596,11 @@ class TrainLoop:
                             and self.step > 0
                         ):
                             return
+                    self.step += 1
+                    pbar.update(1)
                 # Save the last checkpoint if it wasn't already saved.
                 if not self.skip_save:
-                    if self.step % self.save_interval != 0:
+                    if (self.step - 1) % self.save_interval != 0:
                         self.save(self.task_id)
 
     def run_step(self, batch, cond, step):

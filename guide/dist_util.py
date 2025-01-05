@@ -80,14 +80,6 @@ def setup_dist(args):
     dist.init_process_group(backend=backend, init_method="env://")
 
 
-def _find_free_port():
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
 def dev():
     """
     Get the device to use for torch.distributed.
@@ -103,7 +95,7 @@ def load_state_dict(path, **kwargs):
     """
     Load a PyTorch file without redundant fetches across MPI ranks.
     """
-    chunk_size = 2**30  # MPI has a relatively small size limit
+    chunk_size = 2**1  # MPI has a relatively small size limit
     if MPI.COMM_WORLD.Get_rank() == 0:
         with bf.BlobFile(path, "rb") as f:
             data = f.read()
@@ -112,11 +104,13 @@ def load_state_dict(path, **kwargs):
             num_chunks += 1
         MPI.COMM_WORLD.bcast(num_chunks)
         for i in range(0, len(data), chunk_size):
+            print(f"Rank: {MPI.COMM_WORLD.Get_rank()}, chunk: {i}/{len(data)}")
             MPI.COMM_WORLD.bcast(data[i : i + chunk_size])
     else:
         num_chunks = MPI.COMM_WORLD.bcast(None)
         data = bytes()
         for _ in range(num_chunks):
+            print(f"Rank: {MPI.COMM_WORLD.Get_rank()}, chunk: {i}")
             data += MPI.COMM_WORLD.bcast(None)
 
     return th.load(io.BytesIO(data), **kwargs)

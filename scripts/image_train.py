@@ -271,7 +271,7 @@ def run_training_with_args(args):
         train_loop_start_time = time.time()
         if task_id >= args.first_task:
             train_loop.run_loop()
-        global_step += num_steps
+        global_step += lr_anneal_steps
         train_loop_time = time.time() - train_loop_start_time
         wandb_safe_log({"train_loop_time": train_loop_time}, step=global_step)
 
