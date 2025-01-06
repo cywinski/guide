@@ -562,7 +562,7 @@ class TrainLoop:
                     ):
                         wandb_safe_log(logger.getkvs(), step=self.get_global_step())
                         logger.dumpkvs()
-                    if (not self.skip_save) & (self.step % self.save_interval == 0):
+                    if (not self.skip_save) & (self.step % self.save_interval == 0) & (self.step != 0):
                         self.save(self.task_id)
                         self.model.eval()
                         (
