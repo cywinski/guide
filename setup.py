@@ -13,5 +13,5 @@ setup(
         "matplotlib==3.7.5",
         "pytz==2024.1",
         "torchvision"
-    ][],
+    ],
 )
