@@ -95,7 +95,7 @@ def load_state_dict(path, **kwargs):
     """
     Load a PyTorch file without redundant fetches across MPI ranks.
     """
-    chunk_size = 2**1  # MPI has a relatively small size limit
+    chunk_size = 2**30  # MPI has a relatively small size limit
     if MPI.COMM_WORLD.Get_rank() == 0:
         with bf.BlobFile(path, "rb") as f:
             data = f.read()
@@ -104,7 +104,6 @@ def load_state_dict(path, **kwargs):
             num_chunks += 1
         MPI.COMM_WORLD.bcast(num_chunks)
         for i in range(0, len(data), chunk_size):
-            print(f"Rank: {MPI.COMM_WORLD.Get_rank()}, chunk: {i}/{len(data)}")
             MPI.COMM_WORLD.bcast(data[i : i + chunk_size])
     else:
         num_chunks = MPI.COMM_WORLD.bcast(None)

@@ -52,22 +52,14 @@ def get_stratified_subset(frac_selected, labels, seed=0):
     return res
 
 
-def prepare_eval_loaders(
-    train_dataset_splits, val_dataset_splits, args, include_train, generator=False
-):
+def prepare_eval_loaders(val_dataset_splits, num_tasks, batch_size):
     eval_loaders = []
-    for task_id in range(args.num_tasks):
-        if include_train:
-            eval_data = ConcatDataset(
-                [train_dataset_splits[task_id], val_dataset_splits[task_id]]
-            )
-        else:
-            eval_data = val_dataset_splits[task_id]
+    for task_id in range(num_tasks):
+        eval_data = val_dataset_splits[task_id]
         eval_loader = DataLoader(
             dataset=eval_data,
-            batch_size=args.batch_size,
+            batch_size=batch_size,
             shuffle=False,
-            generator=generator,
         )
         eval_loaders.append(eval_loader)
 
