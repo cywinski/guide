@@ -142,26 +142,65 @@ def CIFAR10(
 
 
 def CIFAR100(
-    dataroot, skip_normalization=False, train_aug=False, classifier_augmentation=False
+    dataroot,
+    skip_normalization=False,
+    train_aug=False,
+    classifier_augmentation=False,
+    standard_norm_stats=True,
+    classifier_training=False,
 ):
     train_transform_clf = None
     train_transform_diff = None
+
+    if standard_norm_stats:
+        mean = [0.5, 0.5, 0.5]
+        std = [0.5, 0.5, 0.5]
+    else:
+        mean = [0.5071, 0.4865, 0.4409]
+        std = [0.2673, 0.2564, 0.2762]
+
+    val_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ]
+    )
+
     # augmentation for diffusion training
     if train_aug:
-        train_transform_diff = K.augmentation.ImageSequential(
-            K.augmentation.RandomHorizontalFlip(),
+        train_transform_diff = transforms.Compose(
+            [
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ]
         )
+    else:
+        train_transform_diff = val_transform
 
     # augmentation for classifier training
     if classifier_augmentation:
-        train_transform_clf = K.augmentation.ImageSequential(
-            K.augmentation.Denormalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-            K.augmentation.RandomCrop((32, 32), padding=4),
-            K.augmentation.RandomRotation(30),
-            K.augmentation.RandomHorizontalFlip(),
-            K.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1),
-            K.augmentation.RandomErasing(scale=(0.1, 0.5)),
-            K.augmentation.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        train_transform_clf = transforms.Compose(
+            [
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ]
+        )
+        rehearsal_transform_clf = transforms.Compose(
+            [
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.Normalize(mean, std),
+            ]
+        )
+    else:
+        train_transform_clf = val_transform
+        rehearsal_transform_clf = transforms.Compose(
+            [
+                transforms.Normalize(mean, std),
+            ]
         )
 
     target_transform = transforms.Lambda(lambda y: torch.eye(100)[y])
@@ -170,12 +209,7 @@ def CIFAR100(
         root=dataroot,
         train=True,
         download=True,
-        transform=transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-            ]
-        ),
+        transform=train_transform_clf if classifier_training else train_transform_diff,
         target_transform=target_transform,
     )
     train_dataset = CacheClassLabel(
@@ -187,12 +221,7 @@ def CIFAR100(
         root=dataroot,
         train=False,
         download=True,
-        transform=transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-            ]
-        ),
+        transform=val_transform,
         target_transform=target_transform,
     )
     val_dataset = CacheClassLabel(
@@ -225,8 +254,11 @@ def CIFAR100(
         32,
         3,
         train_transform_clf,
+        rehearsal_transform_clf,
         train_transform_diff,
         100,
+        mean,
+        std,
     )
 
 

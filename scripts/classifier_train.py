@@ -31,22 +31,22 @@ from guide.script_util import (
 )
 
 
-def main():
-    args = create_argparser().parse_args()
-    seed_everything(args.seed)
+def main(args=None, is_sweep=False):
+    if args is None:
+        args = create_argparser().parse_args()
+        if logger.get_rank_without_mpi_import() == 0:
+            if args.wandb_api_key:
+                os.environ["WANDB_API_KEY"] = args.wandb_api_key
+            wandb.init(
+                project=args.wandb_project_name,
+                name=args.wandb_experiment_name,
+                config=args,
+                entity=args.wandb_entity,
+            )
     os.environ["OPENAI_LOGDIR"] = f"results/classifier/{args.wandb_experiment_name}"
     dist_util.setup_dist(args)
-
-    if logger.get_rank_without_mpi_import() == 0:
-        if args.wandb_api_key:
-            os.environ["WANDB_API_KEY"] = args.wandb_api_key
-        wandb.init(
-            project=args.wandb_project_name,
-            name=args.wandb_experiment_name,
-            config=args,
-            entity=args.wandb_entity,
-        )
     args.seed = args.seed + logger.get_rank_without_mpi_import()
+    seed_everything(args.seed)
 
     logger.configure()
 
@@ -123,7 +123,10 @@ def main():
     prev_diffusion_model = None
     prev_diffusion = None
     acc_history = {}
-    for task_id in range(args.num_tasks):
+    n_tasks = args.num_tasks if args.limit_tasks == -1 else args.limit_tasks
+    global global_step
+    global_step = 0
+    for task_id in range(n_tasks):
         train_split = train_dataset_splits[task_id]
         val_split = val_dataset_splits[task_id]
         logger.log(f"***** Running training on task {task_id+1}/{args.num_tasks} *****")
@@ -148,8 +151,10 @@ def main():
         )
         if logger.get_rank_without_mpi_import() == 0:
             for i, (acc, forget) in enumerate(zip(accuracies, forgetting)):
-                logger.logkv(f"task_{i}/test/acc", acc)
-                logger.logkv(f"task_{i}/test/forgetting", forget)
+                wandb.log(
+                    {f"task_{i}/test/acc": acc, f"task_{i}/test/forgetting": forget},
+                    step=global_step,
+                )
                 logger.log(
                     f"Task {i} - Test accuracy: {acc:.2f} - Forgetting: {forget:.2f}"
                 )
@@ -158,11 +163,12 @@ def main():
                 avg_forget = 0
             else:
                 avg_forget = sum(forgetting) / (len(forgetting) - 1)
-            logger.logkv("test/avg_acc", avg_acc)
-            logger.logkv("test/avg_forgetting", avg_forget)
+            wandb.log(
+                {"test/avg_acc": avg_acc, "test/avg_forgetting": avg_forget},
+                step=global_step,
+            )
             logger.log(f"Average test accuracy: {avg_acc:.2f}")
             logger.log(f"Average test forgetting: {avg_forget:.2f}")
-
             # Save the model
             if dist.get_rank() == 0:
                 model_path = os.path.join(
@@ -171,7 +177,7 @@ def main():
                 th.save(curr_classifier.state_dict(), model_path)
 
         ## LOADING NEXT DIFFUSION MODEL ##
-        if task_id < args.num_tasks - 1:
+        if task_id < n_tasks - 1:
             logger.log("loading next diffusion model...")
             prev_diffusion_model, prev_diffusion = create_model_and_diffusion(
                 **args_to_dict(args, model_and_diffusion_defaults().keys())
@@ -197,22 +203,22 @@ def main():
             prev_classifier = copy.deepcopy(curr_classifier)
             prev_classifier.eval()
             prev_classifier.to(dist_util.dev())
-            # gpu_ok = False
-            # if th.cuda.is_available():
-            #     device_cap = th.cuda.get_device_capability()
-            #     if device_cap in ((7, 0), (8, 0), (9, 0)):
-            #         gpu_ok = True
+            gpu_ok = False
+            if th.cuda.is_available():
+                device_cap = th.cuda.get_device_capability()
+                if device_cap in ((7, 0), (8, 0), (9, 0)):
+                    gpu_ok = True
 
-            # if not gpu_ok:
-            #     logger.log(
-            #         "GPU is not NVIDIA V100, A100, or H100. Speedup numbers may be lower "
-            #         "than expected."
-            #     )
-            # else:
-            #     logger.log("Compiling diffusion model")
-            #     prev_diffusion_model = th.compile(
-            #         prev_diffusion_model, mode="reduce-overhead", fullgraph=True
-            #     )
+            if not gpu_ok:
+                logger.log(
+                    "GPU is not NVIDIA V100, A100, or H100. Speedup numbers may be lower "
+                    "than expected."
+                )
+            else:
+                logger.log("Compiling diffusion model")
+                prev_diffusion_model = th.compile(
+                    prev_diffusion_model, mode="reduce-overhead", fullgraph=True
+                )
 
 
 # Training function
@@ -227,6 +233,7 @@ def train_on_task(
     prev_classifier=None,
     rehearsal_transform_classifier=None,
 ):
+    global global_step
     # Initialize the optimizer
     lr = args.lr if task_id != 0 else args.init_lr
     optimizer = th.optim.SGD(
@@ -299,6 +306,13 @@ def train_on_task(
                 else:
                     rehearsal_images = prev_generations.to(dist_util.dev())
                     rehearsal_class_labels = prev_class_labels.to(dist_util.dev())
+                if args.use_knowledge_distillation:
+                    # use soft labels for rehearsal images
+                    rehearsal_class_labels = prev_classifier(rehearsal_images)[
+                        :, : (args.n_classes // args.num_tasks) * task_id
+                    ]
+                    rehearsal_class_labels = F.softmax(rehearsal_class_labels, dim=1)
+                    rehearsal_class_labels = th.argmax(rehearsal_class_labels, dim=1)
                 if rehearsal_transform_classifier is not None:
                     rehearsal_images = rehearsal_transform_classifier(rehearsal_images)
 
@@ -326,8 +340,12 @@ def train_on_task(
             losses[f"task_{task_id}/train/acc"] = (
                 model_output.argmax(dim=1) == class_labels
             ).sum().item() / class_labels.size(0)
-            for key, value in losses.items():
-                logger.logkv(key, value)
+            if logger.get_rank_without_mpi_import() == 0:
+                for key, value in losses.items():
+                    wandb.log(
+                        {key: value},
+                        step=global_step,
+                    )
 
             del losses
             loss = loss.mean()
@@ -351,18 +369,20 @@ def train_on_task(
                     )[0]
 
                     # Get the selected images
-                    selected_images = rehearsal_images[class_indices]
+                    if len(class_indices) > 0:
+                        selected_images = rehearsal_images[class_indices]
 
-                    # Log the images
-                    wandb.log(
-                        {
-                            f"task_{task_id}/train/class_{class_id}_rehearsal_images": [
-                                wandb.Image(selected_images)
-                            ]
-                        },
-                        step=step + epoch * num_update_steps_per_epoch,
-                    )
+                        # Log the images
+                        wandb.log(
+                            {
+                                f"task_{task_id}/train/class_{class_id}_rehearsal_images": [
+                                    wandb.Image(selected_images)
+                                ]
+                            },
+                            step=global_step,
+                        )
             progress_bar.update(1)
+            global_step += 1
         progress_bar.close()
     return curr_classifier
 
@@ -549,6 +569,8 @@ def create_argparser():
         save_images_steps=-1,
         diffusion_dir="",
         seed=1,
+        limit_tasks=-1,
+        use_knowledge_distillation=False,
     )
     defaults.update(all_training_defaults())
     parser = argparse.ArgumentParser()
