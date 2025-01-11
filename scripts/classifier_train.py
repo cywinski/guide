@@ -203,22 +203,22 @@ def main(args=None, is_sweep=False):
             prev_classifier = copy.deepcopy(curr_classifier)
             prev_classifier.eval()
             prev_classifier.to(dist_util.dev())
-            gpu_ok = False
-            if th.cuda.is_available():
-                device_cap = th.cuda.get_device_capability()
-                if device_cap in ((7, 0), (8, 0), (9, 0)):
-                    gpu_ok = True
+            # gpu_ok = False
+            # if th.cuda.is_available():
+            #     device_cap = th.cuda.get_device_capability()
+            #     if device_cap in ((7, 0), (8, 0), (9, 0)):
+            #         gpu_ok = True
 
-            if not gpu_ok:
-                logger.log(
-                    "GPU is not NVIDIA V100, A100, or H100. Speedup numbers may be lower "
-                    "than expected."
-                )
-            else:
-                logger.log("Compiling diffusion model")
-                prev_diffusion_model = th.compile(
-                    prev_diffusion_model, mode="reduce-overhead", fullgraph=True
-                )
+            # if not gpu_ok:
+            #     logger.log(
+            #         "GPU is not NVIDIA V100, A100, or H100. Speedup numbers may be lower "
+            #         "than expected."
+            #     )
+            # else:
+            #     logger.log("Compiling diffusion model")
+            #     prev_diffusion_model = th.compile(
+            #         prev_diffusion_model, mode="reduce-overhead", fullgraph=True
+            #     )
 
 
 # Training function
@@ -260,7 +260,6 @@ def train_on_task(
     prev_class_labels = None
 
     for epoch in range(num_epochs):
-        curr_classifier.train()
         progress_bar = tqdm(
             total=num_update_steps_per_epoch,
             disable=logger.get_rank_without_mpi_import() != 0,
@@ -278,6 +277,7 @@ def train_on_task(
                     step % args.rehearsal_generation_interval == 0
                 ):
                     # generate batch of rehearsal samples
+                    curr_classifier.eval()
                     rehearsal_images, rehearsal_class_labels = sample_examples(
                         n_examples=args.batch_size // 2,
                         batch_size=args.batch_size // 2,
@@ -327,6 +327,7 @@ def train_on_task(
             shuffle = th.randperm(model_input.size(0))
             model_input = model_input[shuffle]
             class_labels = class_labels[shuffle]
+            curr_classifier.train()
 
             model_output = curr_classifier(model_input)
             # train only already seen classes
