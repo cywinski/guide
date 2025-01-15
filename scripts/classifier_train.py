@@ -200,6 +200,54 @@ def main(args=None, is_sweep=False):
                     logger.log(
                         f"Loaded previous diffusion model from {prev_diffusion_model_path}"
                     )
+            elif task_id == 0 and args.diffusion_dir_t0:
+                prev_diffusion_model_path = find_model_with_highest_step(
+                    args.diffusion_dir_t0, task_id
+                )
+                prev_diffusion_model.load_state_dict(
+                    dist_util.load_state_dict(
+                        prev_diffusion_model_path, map_location=dist_util.dev()
+                    )
+                )
+                logger.log(
+                    f"Loaded previous diffusion model from {prev_diffusion_model_path}"
+                )
+            elif task_id == 1 and args.diffusion_dir_t1:
+                prev_diffusion_model_path = find_model_with_highest_step(
+                    args.diffusion_dir_t1, task_id
+                )
+                prev_diffusion_model.load_state_dict(
+                    dist_util.load_state_dict(
+                        prev_diffusion_model_path, map_location=dist_util.dev()
+                    )
+                )
+                logger.log(
+                    f"Loaded previous diffusion model from {prev_diffusion_model_path}"
+                )
+            elif task_id == 2 and args.diffusion_dir_t2:
+                prev_diffusion_model_path = find_model_with_highest_step(
+                    args.diffusion_dir_t2, task_id
+                )
+                prev_diffusion_model.load_state_dict(
+                    dist_util.load_state_dict(
+                        prev_diffusion_model_path, map_location=dist_util.dev()
+                    )
+                )
+                logger.log(
+                    f"Loaded previous diffusion model from {prev_diffusion_model_path}"
+                )
+            elif task_id == 3 and args.diffusion_dir_t3:
+                prev_diffusion_model_path = find_model_with_highest_step(
+                    args.diffusion_dir_t3, task_id
+                )
+                prev_diffusion_model.load_state_dict(
+                    dist_util.load_state_dict(
+                        prev_diffusion_model_path, map_location=dist_util.dev()
+                    )
+                )
+                logger.log(
+                    f"Loaded previous diffusion model from {prev_diffusion_model_path}"
+                )
             prev_classifier = copy.deepcopy(curr_classifier)
             prev_classifier.eval()
             prev_classifier.to(dist_util.dev())
@@ -569,9 +617,13 @@ def create_argparser():
         anneal_lr=False,
         save_images_steps=-1,
         diffusion_dir="",
+        diffusion_dir_t0="",
+        diffusion_dir_t1="",
+        diffusion_dir_t2="",
+        diffusion_dir_t3="",
         seed=1,
         limit_tasks=-1,
-        use_knowledge_distillation=False,
+        use_knowledge_distillation=True,
     )
     defaults.update(all_training_defaults())
     parser = argparse.ArgumentParser()
