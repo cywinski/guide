@@ -9,7 +9,6 @@ import argparse
 import copy
 import os
 import time
-from collections import OrderedDict
 
 import numpy as np
 import torch as th
@@ -18,7 +17,6 @@ import wandb
 from cl_methods.utils import get_cl_method
 from dataloaders import base
 from dataloaders.datasetGen import *
-from dataloaders.utils import prepare_eval_loaders
 from guide import dist_util, logger
 from guide.logger import wandb_safe_log
 from guide.resample import create_named_schedule_sampler
@@ -33,10 +31,8 @@ from guide.script_util import (
     create_model_and_diffusion,
     create_resnet_classifier,
     model_and_diffusion_defaults,
-    results_to_log,
 )
 from guide.train_util import TrainLoop
-from guide.validation import calculate_accuracy_with_classifier
 
 # os.environ["WANDB_MODE"] = "disabled"
 
@@ -143,29 +139,7 @@ def run_training_with_args(args):
         validation_frac=0.0,
     )
 
-    val_dataset_splits, _, classes_per_task = data_split(
-        dataset=val_dataset,
-        return_classes=True,
-        return_task_as_class=False,
-        num_tasks=args.num_tasks,
-        num_classes=n_classes,
-        limit_classes=args.limit_classes,
-        data_seed=args.data_seed,
-        shared_classes=args.shared_classes,
-        first_task_num_classes=args.first_task_num_classes,
-        validation_frac=0.0,
-    )
-
     train_loaders = []
-    validation_loaders = prepare_eval_loaders(
-        train_dataset_splits=train_dataset_splits,
-        val_dataset_splits=val_dataset_splits,
-        args=args,
-        include_train=False,
-        generator=random_generator,
-    )
-    test_acc_table = OrderedDict()
-    train_acc_table = OrderedDict()
 
     train_loop = None
     cl_method = get_cl_method(args)
@@ -274,45 +248,6 @@ def run_training_with_args(args):
         global_step += lr_anneal_steps
         train_loop_time = time.time() - train_loop_start_time
         wandb_safe_log({"train_loop_time": train_loop_time}, step=global_step)
-
-        logger.log("validation...")
-        test_acc_table[task_id] = OrderedDict()
-        train_acc_table[task_id] = OrderedDict()
-        validation_start_time = time.time()
-        for j in range(task_id + 1):
-            if args.train_with_disjoint_classifier:
-                clf_results = calculate_accuracy_with_classifier(
-                    model=(
-                        model if not args.train_with_disjoint_classifier else classifier
-                    ),
-                    task_id=j,
-                    val_loader=validation_loaders[j],
-                    device=dist_util.dev(),
-                    train_loader=(
-                        train_loaders[j - args.first_task]
-                        if j >= args.first_task
-                        else None
-                    ),
-                    max_class=max_class,
-                    train_with_disjoint_classifier=args.train_with_disjoint_classifier,
-                )
-                test_acc_table[j][task_id] = clf_results["accuracy"]["test"]
-                train_acc_table[j][task_id] = clf_results["accuracy"]["train"]
-                logger.log(f"Test accuracy task {j}: {test_acc_table[j][task_id]}")
-                logger.log(f"Train accuracy task {j}: {train_acc_table[j][task_id]}")
-            else:
-                test_acc_table[j][task_id] = 0.0
-                train_acc_table[j][task_id] = 0.0
-
-        validation_time = time.time() - validation_start_time
-        if logger.get_rank_without_mpi_import() == 0:
-            results_to_log(
-                test_acc_table,
-                train_acc_table,
-                validation_time=validation_time,
-                step=global_step,
-                task_id=task_id,
-            )
         if generated_previous_examples is not None:
             th.save(
                 generated_previous_examples,
@@ -321,10 +256,6 @@ def run_training_with_args(args):
                 ),
             )
         train_loop.prev_ddp_model = copy.deepcopy(model)
-    logger.log("TEST ACCURACY TABLE:")
-    logger.log(test_acc_table)
-    logger.log("TRAIN ACCURACY TABLE:")
-    logger.log(train_acc_table)
 
 
 def seed_everything(seed):
