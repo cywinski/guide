@@ -202,7 +202,7 @@ def main(args=None, is_sweep=False):
                     )
             elif task_id == 0 and args.diffusion_dir_t0:
                 prev_diffusion_model_path = find_model_with_highest_step(
-                    args.diffusion_dir_t0, task_id
+                    args.diffusion_dir_t0, 0
                 )
                 prev_diffusion_model.load_state_dict(
                     dist_util.load_state_dict(
@@ -214,7 +214,7 @@ def main(args=None, is_sweep=False):
                 )
             elif task_id == 1 and args.diffusion_dir_t1:
                 prev_diffusion_model_path = find_model_with_highest_step(
-                    args.diffusion_dir_t1, task_id
+                    args.diffusion_dir_t1, 0
                 )
                 prev_diffusion_model.load_state_dict(
                     dist_util.load_state_dict(
@@ -226,7 +226,7 @@ def main(args=None, is_sweep=False):
                 )
             elif task_id == 2 and args.diffusion_dir_t2:
                 prev_diffusion_model_path = find_model_with_highest_step(
-                    args.diffusion_dir_t2, task_id
+                    args.diffusion_dir_t2, 0
                 )
                 prev_diffusion_model.load_state_dict(
                     dist_util.load_state_dict(
@@ -238,7 +238,7 @@ def main(args=None, is_sweep=False):
                 )
             elif task_id == 3 and args.diffusion_dir_t3:
                 prev_diffusion_model_path = find_model_with_highest_step(
-                    args.diffusion_dir_t3, task_id
+                    args.diffusion_dir_t3, 0
                 )
                 prev_diffusion_model.load_state_dict(
                     dist_util.load_state_dict(
@@ -354,13 +354,13 @@ def train_on_task(
                 else:
                     rehearsal_images = prev_generations.to(dist_util.dev())
                     rehearsal_class_labels = prev_class_labels.to(dist_util.dev())
-                if args.use_knowledge_distillation:
-                    # use soft labels for rehearsal images
-                    rehearsal_class_labels = prev_classifier(rehearsal_images)[
-                        :, : (args.n_classes // args.num_tasks) * task_id
-                    ]
-                    rehearsal_class_labels = F.softmax(rehearsal_class_labels, dim=1)
-                    rehearsal_class_labels = th.argmax(rehearsal_class_labels, dim=1)
+                # if args.use_knowledge_distillation:
+                #     # use soft labels for rehearsal images
+                #     rehearsal_class_labels = prev_classifier(rehearsal_images)[
+                #         :, : (args.n_classes // args.num_tasks) * task_id
+                #     ]
+                #     rehearsal_class_labels = F.softmax(rehearsal_class_labels, dim=1)
+                #     rehearsal_class_labels = th.argmax(rehearsal_class_labels, dim=1)
                 if rehearsal_transform_classifier is not None:
                     rehearsal_images = rehearsal_transform_classifier(rehearsal_images)
 
@@ -384,7 +384,7 @@ def train_on_task(
             ]
             loss = F.cross_entropy(model_output, class_labels, reduction="none")
             losses = {}
-            losses[f"task_{task_id}/train/loss"] = loss.detach()
+            losses[f"task_{task_id}/train/loss"] = loss.detach().mean()
             losses[f"task_{task_id}/train/lr"] = optimizer.param_groups[0]["lr"]
             losses[f"task_{task_id}/train/acc"] = (
                 model_output.argmax(dim=1) == class_labels
@@ -413,13 +413,10 @@ def train_on_task(
             ):
                 for class_id in range((args.n_classes // args.num_tasks) * task_id):
                     # Find indices of images belonging to the current class
-                    class_indices = np.where(
-                        rehearsal_class_labels.cpu().numpy() == class_id
-                    )[0]
-
+                    class_indices = np.where(class_labels.cpu().numpy() == class_id)[0]
                     # Get the selected images
                     if len(class_indices) > 0:
-                        selected_images = rehearsal_images[class_indices]
+                        selected_images = model_input[class_indices]
 
                         # Log the images
                         wandb.log(
